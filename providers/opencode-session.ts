@@ -12,6 +12,7 @@ import type {
 	Model,
 	ProviderHeaders,
 	SimpleStreamOptions,
+	StreamFunction,
 } from "@earendil-works/pi-ai/compat";
 import type {
 	ProviderConfig,
@@ -457,7 +458,7 @@ async function pipeStream(
 export function createOpenCodeStreamSimple(
 	tracker: OpenCodeSessionTracker,
 ): NonNullable<ProviderConfig["streamSimple"]> {
-	return (model, context, options) => {
+	return (model, context, options?) => {
 		const headers = createOpenCodeHeaders(tracker, options?.headers);
 		const stream = new DeferredAssistantMessageEventStream();
 
@@ -608,12 +609,15 @@ export function ensureOpenCodeApiProviderRegistered(
 			// stream and streamSimple return async-iterable streams; using the
 			// same implementation for both is safe — the compat wrappers only
 			// validate model.api and forward the call.
-			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			const opencodeStreamFn = streamFn as StreamFunction<
+				"opencode-dynamic",
+				SimpleStreamOptions
+			>;
 			registerApiProvider(
 				{
 					api: OPENCODE_DYNAMIC_API,
-					stream: streamFn as any,
-					streamSimple: streamFn,
+					stream: opencodeStreamFn,
+					streamSimple: opencodeStreamFn,
 				},
 				sourceId,
 			);
