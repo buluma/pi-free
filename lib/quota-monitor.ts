@@ -14,7 +14,39 @@
  *   5. x-ratelimit-remaining-requests-day / x-ratelimit-limit-requests-day (SambaNova daily)
  */
 
+import { createLogger } from "./logger.ts";
+
+const _logger = createLogger("quota-monitor");
+
 const _quotaState = new Map<string, QuotaSnapshot>();
+
+/** Per-provider response outcome counters (M2 + Mn3, #437). */
+export interface ProviderResponseCounters {
+	/** 401 and 403 responses (auth failures). */
+	authFailures: number;
+	/** 429 responses (rate limited). */
+	rateLimited: number;
+	/** 5xx responses (gateway/server errors). */
+	serverErrors: number;
+	/** Responses carrying rate-limit headers none of which matched a known format. */
+	quotaHeaderDrift: number;
+}
+
+const _responseCounters = new Map<string, ProviderResponseCounters>();
+
+function responseCountersEntry(providerId: string): ProviderResponseCounters {
+	let entry = _responseCounters.get(providerId);
+	if (!entry) {
+		entry = {
+			authFailures: 0,
+			rateLimited: 0,
+			serverErrors: 0,
+			quotaHeaderDrift: 0,
+		};
+		_responseCounters.set(providerId, entry);
+	}
+	return entry;
+}
 
 /** Snapshot of quota state for a single provider. */
 export interface QuotaSnapshot {
@@ -47,7 +79,7 @@ const HEADER_PAIRS: [string, string][] = [
  * Attempt to extract quota from response headers.
  * Returns { remaining, limit, source } or null if no quota headers found.
  */
-export function extractQuota(
+function extractQuota(
 	headers: Record<string, string>,
 ): { remaining: number; limit: number; source: string } | null {
 	// Normalize keys to lowercase for case-insensitive matching.
@@ -58,8 +90,11 @@ export function extractQuota(
 	}
 
 	for (const [remainingKey, limitKey] of HEADER_PAIRS) {
-		const remaining = Number.parseFloat(normalized[remainingKey]);
-		const limit = Number.parseFloat(normalized[limitKey]);
+		const remainingRaw = normalized[remainingKey];
+		const limitRaw = normalized[limitKey];
+		if (remainingRaw === undefined || limitRaw === undefined) continue;
+		const remaining = Number.parseFloat(remainingRaw);
+		const limit = Number.parseFloat(limitRaw);
 		if (Number.isFinite(remaining) && Number.isFinite(limit) && limit > 0) {
 			return { remaining, limit, source: remainingKey };
 		}
@@ -69,15 +104,52 @@ export function extractQuota(
 }
 
 /**
- * Process an after_provider_response event, updating quota state.
- * Call from the event handler in index.ts.
+ * Process an after_provider_response event, updating quota state and the
+ * per-provider response-outcome counters (M2, #437).
+ *
+ * The status feeds 401/403 (auth failure), 429 (rate limit) and 5xx (server
+ * error) counters — counts only, never response bodies. Mn3: when rate-limit
+ * headers are present but none matched a known pair (header-format drift), a
+ * per-provider drift counter is bumped and the mismatch is debug-logged.
  */
 export function processQuotaResponse(
 	providerId: string,
+	status: number,
 	headers: Record<string, string>,
 ): void {
+	const counters = responseCountersEntry(providerId);
+	if (status === 401 || status === 403) {
+		counters.authFailures += 1;
+	} else if (status === 429) {
+		counters.rateLimited += 1;
+	} else if (status >= 500 && status < 600) {
+		counters.serverErrors += 1;
+	}
+
 	const extracted = extractQuota(headers);
-	if (!extracted) return;
+	if (!extracted) {
+		// Mn3: rate-limit headers present but none matched a known pair. Only
+		// count as drift when BOTH halves of a quota pair appear to exist but
+		// no known format matched — a remaining-only or limit-only header is a
+		// legitimate half-signal, not a format drift.
+		const keys = Object.keys(headers).map((k) => k.toLowerCase());
+		const hasRemaining = keys.some((k) =>
+			/remaining|remaining-requests/.test(k),
+		);
+		const hasLimit = keys.some((k) => /(^|-)limit/.test(k));
+		if (hasRemaining && hasLimit) {
+			counters.quotaHeaderDrift += 1;
+			_logger.debug(
+				`Quota headers present but none matched for ${providerId}`,
+				{
+					provider: providerId,
+					status,
+					presentKeys: keys,
+				},
+			);
+		}
+		return;
+	}
 
 	const percent = Math.round((extracted.remaining / extracted.limit) * 100);
 
@@ -91,17 +163,29 @@ export function processQuotaResponse(
 }
 
 /**
+ * Get the response-outcome counters for a provider, or null if none recorded.
+ */
+export function getResponseCounters(
+	providerId: string,
+): ProviderResponseCounters | null {
+	return _responseCounters.get(providerId) ?? null;
+}
+
+/**
+ * Get all tracked response-outcome counters.
+ */
+export function getAllResponseCounters(): ReadonlyMap<
+	string,
+	ProviderResponseCounters
+> {
+	return _responseCounters;
+}
+
+/**
  * Get the latest quota snapshot for a provider, or null if unknown.
  */
 export function getQuota(providerId: string): QuotaSnapshot | null {
 	return _quotaState.get(providerId) ?? null;
-}
-
-/**
- * Get all tracked quotas.
- */
-export function getAllQuotas(): ReadonlyMap<string, QuotaSnapshot> {
-	return _quotaState;
 }
 
 /**

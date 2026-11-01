@@ -10,6 +10,10 @@
 import { createLogger } from "./logger.ts";
 import { resolveSafeDataFile } from "./paths.ts";
 import { createJSONStore } from "./json-persistence.ts";
+import type {
+	PiAiResolutionEvent,
+	PiAiResolutionSnapshot,
+} from "./pi-ai-loader.ts";
 
 const _logger = createLogger("telemetry");
 
@@ -17,7 +21,10 @@ const _logger = createLogger("telemetry");
 // Types
 // =============================================================================
 
-export interface TelemetryEntry {
+/** Structured failure classification derived from status codes / error text (M2, #437). */
+export type ErrorClass = "401" | "403" | "429" | "5xx" | "network" | "other";
+
+interface TelemetryEntry {
 	timestamp: number;
 	provider: string;
 	model: string;
@@ -28,8 +35,12 @@ export interface TelemetryEntry {
 	totalTokens: number;
 	tokensPerSecond: number;
 	cost: number;
-	stopReason?: string;
+	stopReason?: string | undefined;
 	error?: string;
+	/** HTTP status code when the failure came from a provider response. */
+	statusCode?: number;
+	/** Structured failure classification (derived when not supplied). */
+	errorClass?: ErrorClass;
 }
 
 export interface ModelTelemetry {
@@ -59,11 +70,53 @@ export interface ModelTelemetry {
 	recentCalls: TelemetryEntry[];
 }
 
-export interface TelemetryStore {
+interface TelemetryStore {
 	/** Keyed by "provider/model" */
 	models: Record<string, ModelTelemetry>;
 	/** When the store was last updated. */
 	lastUpdated: number;
+	/**
+	 * pi-ai resolution diagnostics, one record per session. **Additive and
+	 * optional**: a telemetry file written before this existed simply has no
+	 * `diagnostics` key, and every reader goes through `?.` — old records keep
+	 * parsing with their model data intact.
+	 */
+	diagnostics?: { piAi?: PiAiDiagnostics };
+}
+
+/**
+ * Durable half of the pi-ai doctor (#585). One record per session, so a
+ * support transcript can show what an install resolved even after the process
+ * that hit the problem is gone — the #581 report had none of this.
+ *
+ * Credential-free by construction: absolute paths, versions, booleans and
+ * loader event codes only.
+ */
+export interface PiAiDiagnostics {
+	/** Epoch ms of the recorded snapshot. */
+	recordedAt: number;
+	/** Bare-specifier copy (the one Node resolves without the entry check). */
+	fastPathRoot: string | null;
+	fastPathVersion: string | null;
+	/** Per allow-listed entry: does the fast-path copy define it? */
+	fastPathDefines: Record<string, boolean>;
+	/** Fast-path copy exists but cannot serve an entry (#581 shape). */
+	shadowed: boolean;
+	/** `dist/vendor` bundles present (Bun-compiled hosts need them). */
+	vendored: boolean;
+	/** Entry-aware resolution per allow-listed entry. */
+	entries: Record<string, PiAiEntryDiagnostics>;
+	/** Session loads that fell off the fast path (loader-bounded and deduped). */
+	events: PiAiResolutionEvent[];
+}
+
+/** One entry's resolved source, as persisted. */
+export interface PiAiEntryDiagnostics {
+	root: string | null;
+	version: string | null;
+	file: string | null;
+	source: "on-disk" | "vendored" | null;
+	via: string | null;
 }
 
 // =============================================================================
@@ -234,55 +287,56 @@ export function getModelTelemetry(
 }
 
 /**
- * Format a model's telemetry as a human-readable string (for status bar / /model list).
- * Returns undefined if no telemetry data is available.
+ * Persist one pi-ai resolution snapshot into the telemetry file.
+ *
+ * The durable counterpart of `/pi-free-health`'s live section: the health
+ * report is only visible while the process lives, and the #581 report arrived
+ * with nothing but a stack trace. Overwrites the previous record (one per
+ * session) rather than appending, so the file cannot grow with every reload.
  */
-export function formatModelTelemetry(
-	provider: string,
-	model: string,
-): string | undefined {
-	const telemetry = getModelTelemetry(provider, model);
-	if (!telemetry || telemetry.totalCalls === 0) return undefined;
-
-	const parts: string[] = [];
-	if (telemetry.totalCalls > 0) {
-		parts.push(`${telemetry.totalCalls} calls`);
+export async function recordPiAiDiagnostics(
+	snapshot: PiAiResolutionSnapshot,
+): Promise<void> {
+	const entries: Record<string, PiAiEntryDiagnostics> = {};
+	for (const [entry, resolution] of Object.entries(snapshot.entries)) {
+		entries[entry] = {
+			root: resolution.root,
+			version: resolution.version,
+			file: resolution.file,
+			source: resolution.source,
+			via: resolution.via,
+		};
 	}
-	if (telemetry.successRate > 0) {
-		parts.push(`${telemetry.successRate}% ok`);
-	}
-	if (telemetry.avgLatencyMs > 0) {
-		parts.push(`${telemetry.avgLatencyMs}ms`);
-	}
-	if (telemetry.avgTokensPerSecond > 0) {
-		parts.push(`${telemetry.avgTokensPerSecond} tok/s`);
-	}
-
-	return parts.length > 0 ? parts.join(" · ") : undefined;
+	const piAi: PiAiDiagnostics = {
+		recordedAt: Date.now(),
+		fastPathRoot: snapshot.fastPath.root,
+		fastPathVersion: snapshot.fastPath.version,
+		fastPathDefines: { ...snapshot.fastPath.defines },
+		shadowed: snapshot.shadowed,
+		vendored: snapshot.vendored,
+		entries,
+		events: snapshot.events,
+	};
+	await _store.update((store) => ({
+		...store,
+		diagnostics: { ...store.diagnostics, piAi },
+		lastUpdated: Date.now(),
+	}));
+	// Flush immediately. Telemetry writes are debounced (1500ms) to coalesce
+	// chatty per-turn call records, but this record is written once per session
+	// and Pi calls process.exit(0) right after extension startup (see
+	// lib/logger.ts): a debounced diagnostics write would routinely vanish with
+	// the exact process that needed to record it. Same rationale as
+	// clearTelemetry, and bounded to one flush per session.
+	await _store.flush();
 }
 
 /**
- * Get telemetry summary for a provider (all models combined).
+ * The persisted pi-ai diagnostics, or undefined for a telemetry file written
+ * before the record existed (or one that has not seen a session yet).
  */
-export function getProviderTelemetry(provider: string): {
-	totalCalls: number;
-	totalCost: number;
-	models: number;
-} {
-	const store = _store.load();
-	let totalCalls = 0;
-	let totalCost = 0;
-	let models = 0;
-
-	for (const [key, data] of Object.entries(store.models)) {
-		if (key.startsWith(`${provider}/`)) {
-			totalCalls += data.totalCalls;
-			totalCost += data.totalCost;
-			models++;
-		}
-	}
-
-	return { totalCalls, totalCost, models };
+export function getPiAiDiagnostics(): PiAiDiagnostics | undefined {
+	return _store.load().diagnostics?.piAi;
 }
 
 /**
@@ -306,8 +360,51 @@ export function startModelCall(provider: string, model: string): string {
 /** Options for {@link recordModelCall} */
 export interface RecordModelCallOptions {
 	success: boolean;
-	stopReason?: string;
-	errorMessage?: string;
+	stopReason?: string | undefined;
+	errorMessage?: string | undefined;
+	/** HTTP status code observed on the provider response. */
+	statusCode?: number;
+	/** Structured failure class; derived from the message when omitted. */
+	errorClass?: ErrorClass;
+}
+
+/**
+ * Derive a structured {@link ErrorClass} from a status code and/or error
+ * message. Best-effort classification used to turn opaque "failed" telemetry
+ * entries into incident-relevant buckets (Cline workos: 401 vs 403-vs-headers
+ * vs gateway 5xx). Numeric status codes win when present; otherwise the error
+ * text is scanned for embedded statuses or network-failure fingerprints.
+ */
+export function classifyError(
+	message: string | undefined,
+	statusCode?: number,
+): ErrorClass | undefined {
+	if (!message && statusCode === undefined) return undefined;
+	if (statusCode !== undefined) {
+		if (statusCode === 401) return "401";
+		if (statusCode === 403) return "403";
+		if (statusCode === 429) return "429";
+		if (statusCode >= 500 && statusCode < 600) return "5xx";
+		// A non-failure status (e.g. 200) carries no class unless the message
+		// itself describes a failure.
+		if (!message) return undefined;
+	}
+	if (message) {
+		// A fetch-level network failure (TypeError in browsers, node-style
+		// undici/fetch errors) is distinct from an HTTP status failure.
+		if (
+			/Failed to fetch|fetch failed|network error|ECONN|ENOTFOUND|EHOST|EAI_AGAIN|ETIMEDOUT|socket hang up|underlying connection|unexpected end of file/i.test(
+				message,
+			)
+		) {
+			return "network";
+		}
+		if (/\b401\b/.test(message)) return "401";
+		if (/\b403\b/.test(message)) return "403";
+		if (/\b429\b/.test(message)) return "429";
+		if (/\b5\d\d\b/.test(message)) return "5xx";
+	}
+	return "other";
 }
 
 /**
@@ -330,7 +427,7 @@ export async function recordModelCall(
 	cost: number,
 	options: RecordModelCallOptions,
 ): Promise<void> {
-	const { success, stopReason, errorMessage } = options;
+	const { success, stopReason, errorMessage, statusCode, errorClass } = options;
 	// Wall clock for the stored entry timestamp; monotonic clock for the
 	// elapsed-latency measurement so NTP adjustments or system suspend cannot
 	// corrupt the recorded duration.
@@ -369,6 +466,9 @@ export async function recordModelCall(
 		latencyMs > 0
 			? Number.parseFloat((totalTokens / (latencyMs / 1000)).toFixed(1))
 			: 0;
+	const derivedErrorClass =
+		errorClass ??
+		(errorMessage ? classifyError(errorMessage, statusCode) : undefined);
 
 	const entry: TelemetryEntry = {
 		timestamp: now,
@@ -383,6 +483,8 @@ export async function recordModelCall(
 		cost,
 		stopReason,
 		...(errorMessage ? { error: errorMessage } : {}),
+		...(statusCode === undefined ? {} : { statusCode }),
+		...(derivedErrorClass ? { errorClass: derivedErrorClass } : {}),
 	};
 
 	await addEntry(entry);
@@ -414,4 +516,51 @@ export async function clearTelemetry(): Promise<void> {
  */
 export function getTelemetryPath(): string {
 	return TELEMETRY_FILE;
+}
+
+/** Per-provider aggregation of telemetry failure classes (M2, #437). */
+export interface ProviderErrorCounts {
+	/** 401 + 403 (auth failures). */
+	authFailures: number;
+	"401": number;
+	"403": number;
+	"429": number;
+	"5xx": number;
+	network: number;
+	other: number;
+}
+
+/**
+ * Aggregate failure classes per provider from recorded telemetry entries.
+ * Status codes/classes only — never error bodies or messages.
+ */
+export function getProviderErrorCounts(): ReadonlyMap<
+	string,
+	ProviderErrorCounts
+> {
+	const counts = new Map<string, ProviderErrorCounts>();
+	const bump = (provider: string, errorClass: ErrorClass): void => {
+		let entry = counts.get(provider);
+		if (!entry) {
+			entry = {
+				authFailures: 0,
+				"401": 0,
+				"403": 0,
+				"429": 0,
+				"5xx": 0,
+				network: 0,
+				other: 0,
+			};
+			counts.set(provider, entry);
+		}
+		entry[errorClass] += 1;
+		if (errorClass === "401" || errorClass === "403") entry.authFailures += 1;
+	};
+
+	for (const telemetry of Object.values(_store.load().models)) {
+		for (const entry of telemetry.recentCalls) {
+			if (entry.errorClass) bump(entry.provider, entry.errorClass);
+		}
+	}
+	return counts;
 }

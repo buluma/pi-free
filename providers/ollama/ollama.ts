@@ -30,13 +30,17 @@ import {
 import { createLogger } from "../../lib/logger.ts";
 import {
 	loadProviderCache,
-	saveProviderCache,
+	saveProviderCacheGuarded,
 } from "../../lib/provider-cache.ts";
 import {
 	getModelsDueForProbe,
 	recordModelProbeResults,
 } from "../../lib/probe-cache.ts";
-import { fetchWithRetry, fetchWithTimeout } from "../../lib/util.ts";
+import {
+	fetchWithRetry,
+	fetchWithTimeout,
+	withSignal,
+} from "../../lib/util.ts";
 import { resolveThinkingMap } from "./thinking-levels.ts";
 import {
 	createOllamaProvider as createNativeOllamaProvider,
@@ -68,24 +72,26 @@ const OLLAMA_KNOWN_403_MODELS: ReadonlySet<string> = new Set([
 // =============================================================================
 // Fallback models (used when API is unreachable and no cache exists)
 // =============================================================================
-export const FALLBACK_MODELS: ProviderModelConfig[] = [
+const FALLBACK_MODELS: ProviderModelConfig[] = [
 	{
-		id: "glm-5.1",
-		name: "GLM 5.1",
-		reasoning: false,
+		id: "glm-5.2",
+		name: "GLM 5.2",
+		reasoning: true,
+		thinkingLevelMap: resolveThinkingMap("glm-5.2", ["thinking", "tools"]),
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 202752,
+		contextWindow: 1000000,
 		maxTokens: 32768,
 		compat: { supportsDeveloperRole: false },
 	},
 	{
-		id: "gemma4:31b",
-		name: "Gemma 4 31B",
-		reasoning: false,
+		id: "glm-5.1",
+		name: "GLM 5.1",
+		reasoning: true,
+		thinkingLevelMap: resolveThinkingMap("glm-5.1", ["thinking", "tools"]),
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 262144,
+		contextWindow: 202752,
 		maxTokens: 32768,
 		compat: { supportsDeveloperRole: false },
 	},
@@ -99,18 +105,88 @@ export const FALLBACK_MODELS: ProviderModelConfig[] = [
 		]),
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 1000000,
+		contextWindow: 524288,
 		maxTokens: 32768,
 		compat: { supportsDeveloperRole: false },
 	},
 	{
-		id: "qwen3.5",
-		name: "Qwen 3.5",
+		id: "deepseek-v4-pro:0813",
+		name: "DeepSeek V4 Pro 0813",
 		reasoning: true,
-		thinkingLevelMap: resolveThinkingMap("qwen3.5", ["thinking", "tools"]),
+		thinkingLevelMap: resolveThinkingMap("deepseek-v4-pro:0813", [
+			"thinking",
+			"tools",
+		]),
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		contextWindow: 131072,
+		contextWindow: 524288,
+		maxTokens: 32768,
+		compat: { supportsDeveloperRole: false },
+	},
+	{
+		id: "deepseek-v4-pro:preview",
+		name: "DeepSeek V4 Pro Preview",
+		reasoning: true,
+		thinkingLevelMap: resolveThinkingMap("deepseek-v4-pro:preview", [
+			"thinking",
+			"tools",
+		]),
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 524288,
+		maxTokens: 32768,
+		compat: { supportsDeveloperRole: false },
+	},
+	{
+		id: "deepseek-v4-flash:0731",
+		name: "DeepSeek V4 Flash 0731",
+		reasoning: true,
+		thinkingLevelMap: resolveThinkingMap("deepseek-v4-flash:0731", [
+			"thinking",
+			"tools",
+		]),
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1048576,
+		maxTokens: 32768,
+		compat: { supportsDeveloperRole: false },
+	},
+	{
+		id: "deepseek-v4-flash:preview",
+		name: "DeepSeek V4 Flash Preview",
+		reasoning: true,
+		thinkingLevelMap: resolveThinkingMap("deepseek-v4-flash:preview", [
+			"thinking",
+			"tools",
+		]),
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1048576,
+		maxTokens: 32768,
+		compat: { supportsDeveloperRole: false },
+	},
+	{
+		id: "kimi-k3",
+		name: "Kimi K3",
+		reasoning: true,
+		thinkingLevelMap: resolveThinkingMap("kimi-k3", ["thinking", "tools"]),
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 1048576,
+		maxTokens: 32768,
+		compat: { supportsDeveloperRole: false },
+	},
+	{
+		id: "kimi-k2.7-code",
+		name: "Kimi K2.7 Code",
+		reasoning: true,
+		thinkingLevelMap: resolveThinkingMap("kimi-k2.7-code", [
+			"thinking",
+			"tools",
+		]),
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 262144,
 		maxTokens: 32768,
 		compat: { supportsDeveloperRole: false },
 	},
@@ -121,7 +197,125 @@ export const FALLBACK_MODELS: ProviderModelConfig[] = [
 		thinkingLevelMap: resolveThinkingMap("kimi-k2.6", ["thinking", "tools"]),
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 262144,
+		maxTokens: 32768,
+		compat: { supportsDeveloperRole: false },
+	},
+	{
+		id: "gemma4:31b",
+		name: "Gemma 4 31B",
+		reasoning: true,
+		thinkingLevelMap: resolveThinkingMap("gemma4:31b", ["thinking", "tools"]),
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 262144,
+		maxTokens: 32768,
+		compat: { supportsDeveloperRole: false },
+	},
+	{
+		id: "qwen3.5:397b",
+		name: "Qwen 3.5 397B",
+		reasoning: true,
+		thinkingLevelMap: resolveThinkingMap("qwen3.5:397b", ["thinking", "tools"]),
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 262144,
+		maxTokens: 32768,
+		compat: { supportsDeveloperRole: false },
+	},
+	{
+		id: "minimax-m3",
+		name: "MiniMax M3",
+		reasoning: true,
+		thinkingLevelMap: resolveThinkingMap("minimax-m3", ["thinking", "tools"]),
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 524288,
+		maxTokens: 32768,
+		compat: { supportsDeveloperRole: false },
+	},
+	{
+		id: "minimax-m2.7",
+		name: "MiniMax M2.7",
+		reasoning: true,
+		thinkingLevelMap: resolveThinkingMap("minimax-m2.7", ["thinking", "tools"]),
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 196608,
+		maxTokens: 32768,
+		compat: { supportsDeveloperRole: false },
+	},
+	{
+		id: "nemotron-3-ultra",
+		name: "Nemotron 3 Ultra",
+		reasoning: true,
+		thinkingLevelMap: resolveThinkingMap("nemotron-3-ultra", [
+			"thinking",
+			"tools",
+		]),
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 262144,
+		maxTokens: 32768,
+		compat: { supportsDeveloperRole: false },
+	},
+	{
+		id: "nemotron-3-super",
+		name: "Nemotron 3 Super",
+		reasoning: true,
+		thinkingLevelMap: resolveThinkingMap("nemotron-3-super", [
+			"thinking",
+			"tools",
+		]),
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 262144,
+		maxTokens: 32768,
+		compat: { supportsDeveloperRole: false },
+	},
+	{
+		id: "nemotron-3-nano:30b",
+		name: "Nemotron 3 Nano 30B",
+		reasoning: true,
+		thinkingLevelMap: resolveThinkingMap("nemotron-3-nano:30b", [
+			"thinking",
+			"tools",
+		]),
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 262144,
+		maxTokens: 32768,
+		compat: { supportsDeveloperRole: false },
+	},
+	{
+		id: "gpt-oss:120b",
+		name: "GPT-OSS 120B",
+		reasoning: true,
+		thinkingLevelMap: resolveThinkingMap("gpt-oss:120b", ["thinking", "tools"]),
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 131072,
+		maxTokens: 32768,
+		compat: { supportsDeveloperRole: false },
+	},
+	{
+		id: "gpt-oss:20b",
+		name: "GPT-OSS 20B",
+		reasoning: true,
+		thinkingLevelMap: resolveThinkingMap("gpt-oss:20b", ["thinking", "tools"]),
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 131072,
+		maxTokens: 32768,
+		compat: { supportsDeveloperRole: false },
+	},
+	{
+		id: "mistral-large-3:675b",
+		name: "Mistral Large 3 675B",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 262144,
 		maxTokens: 32768,
 		compat: { supportsDeveloperRole: false },
 	},
@@ -155,7 +349,9 @@ async function concurrentMap<T, R>(
 	workers: number,
 	fn: (item: T) => Promise<R>,
 ): Promise<PromiseSettledResult<R>[]> {
-	const results: PromiseSettledResult<R>[] = new Array(items.length);
+	const results: PromiseSettledResult<R>[] = Array.from({
+		length: items.length,
+	});
 	let next = 0;
 	await Promise.all(
 		Array.from({ length: Math.max(1, workers) }, async () => {
@@ -164,7 +360,8 @@ async function concurrentMap<T, R>(
 				try {
 					results[index] = {
 						status: "fulfilled",
-						value: await fn(items[index]),
+						// Pool guard (`next < items.length`) proves defined.
+						value: await fn(items[index]!),
 					};
 				} catch (reason) {
 					results[index] = { status: "rejected", reason };
@@ -186,13 +383,15 @@ async function fetchModelIds(
 ): Promise<string[]> {
 	const response = await fetchWithRetry(
 		`${BASE_URL_OLLAMA}/models`,
-		{
-			headers: {
-				Authorization: `Bearer ${apiKey}`,
-				"Content-Type": "application/json",
+		withSignal(
+			{
+				headers: {
+					Authorization: `Bearer ${apiKey}`,
+					"Content-Type": "application/json",
+				},
 			},
 			signal,
-		},
+		),
 		3,
 		1000,
 		DEFAULT_FETCH_TIMEOUT_MS,
@@ -221,15 +420,17 @@ async function fetchModelDetails(
 ): Promise<OllamaShowResponse> {
 	const response = await fetchWithTimeout(
 		`${OLLAMA_API_BASE}/api/show`,
-		{
-			method: "POST",
-			headers: {
-				Authorization: `Bearer ${apiKey}`,
-				"Content-Type": "application/json",
+		withSignal(
+			{
+				method: "POST",
+				headers: {
+					Authorization: `Bearer ${apiKey}`,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({ model: modelId }),
 			},
-			body: JSON.stringify({ model: modelId }),
 			signal,
-		},
+		),
 		DETAIL_FETCH_TIMEOUT_MS,
 	);
 
@@ -318,7 +519,7 @@ function assembleModels(
 // Fetch all models (orchestrates /v1/models + /api/show)
 // =============================================================================
 
-export async function fetchAllModels(
+async function fetchAllModels(
 	apiKey: string,
 	cachedModels: ProviderModelConfig[] = loadProviderCache(PROVIDER_OLLAMA) ??
 		[],
@@ -400,6 +601,11 @@ export async function fetchAllModels(
 	return applyHidden(models, PROVIDER_OLLAMA);
 }
 
+/**
+ * Probe configured models, auto-hide 403s, and refresh the cache.
+ * Exported for the cache-guard regression test (#607); production
+ * reaches it through OLLAMA_PROVIDER_DEPS.probeModels.
+ */
 export async function runOllamaProbe(
 	apiKey: string,
 	modelsToTest: ProviderModelConfig[],
@@ -460,16 +666,28 @@ export async function runOllamaProbe(
 		return { hidden_models: Array.from(existingHidden) };
 	});
 
-	// Re-fetch and re-register so hidden models disappear immediately
+	// Re-fetch and re-register so hidden models disappear immediately.
+	// Guarded like the native paths: a degenerate re-fetch keeps the
+	// previous cache AND the live list instead of poisoning both (#607).
 	try {
 		const fresh = await fetchAllModels(
 			apiKey,
 			loadProviderCache(PROVIDER_OLLAMA),
 		);
-		await saveProviderCache(PROVIDER_OLLAMA, fresh);
+		if (!(await saveProviderCacheGuarded(PROVIDER_OLLAMA, fresh))) {
+			_logger.warn(
+				"Ollama post-probe refresh returned a degenerate list; keeping current models",
+				{ fetched: fresh.length },
+			);
+			return notFound;
+		}
 		applyModels(fresh);
-	} catch {
-		// If refresh fails, keep current models. The next refresh/probe will retry.
+	} catch (error) {
+		// If refresh fails, keep current models. The next refresh/probe will
+		// retry — but stay diagnosable instead of failing silently.
+		_logger.warn("Ollama post-probe refresh failed; keeping current models", {
+			error: error instanceof Error ? error.message : String(error),
+		});
 	}
 
 	_logger.info(

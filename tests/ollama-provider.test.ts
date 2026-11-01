@@ -9,31 +9,60 @@ const mockGetOllamaApiKey = vi.hoisted(() =>
 	vi.fn((): string | undefined => undefined),
 );
 const mockGetOllamaShowPaid = vi.hoisted(() => vi.fn(() => false));
+const mockGetModelViewOverride = vi.hoisted(() =>
+	vi.fn((_providerId: string): "free" | "all" | undefined => undefined),
+);
+const mockSetModelViewOverride = vi.hoisted(() => vi.fn());
 const mockGetGlobalFreeOnly = vi.hoisted(() => vi.fn(() => true));
 const mockFetchWithRetry = vi.hoisted(() => vi.fn());
 const mockFetchWithTimeout = vi.hoisted(() => vi.fn());
 const mockSaveProviderCache = vi.hoisted(() =>
 	vi.fn(async (..._args: unknown[]) => undefined),
 );
+const mockSaveConfig = vi.hoisted(() => vi.fn(async () => undefined));
 
 vi.mock("../config.ts", () => ({
 	getOllamaApiKey: () => mockGetOllamaApiKey(),
 	getOllamaShowPaid: () => mockGetOllamaShowPaid(),
+	isOhMyPiCompat: () => false,
+	getModelViewOverride: (providerId: string) =>
+		mockGetModelViewOverride(providerId),
+	setModelViewOverride: (...args: unknown[]) =>
+		mockSetModelViewOverride(...args),
 	applyHidden: (models: unknown[]) => models,
 	updateConfig: vi.fn(),
-	saveConfig: vi.fn(),
+	saveConfig: mockSaveConfig,
 }));
 
 vi.mock("../lib/registry.ts", () => ({
 	getGlobalFreeOnly: () => mockGetGlobalFreeOnly(),
-	getGlobalFreeOnlyForced: () => false,
+	// Mirrors the real resolveModelView over the mocked config getters (the
+	// real rule is unit-tested in registry-provider-overrides.test.ts).
+	resolveModelView: (providerId: string) =>
+		mockGetModelViewOverride(providerId) ??
+		(mockGetOllamaShowPaid()
+			? "all"
+			: mockGetGlobalFreeOnly()
+				? "free"
+				: "all"),
 	registerWithGlobalToggle: vi.fn(),
+	// Free=all matches what these tests were written against; the provider
+	// now reclassifies via this fn on restore/fetch instead of trusting it.
+	isFreeModel: () => true,
 }));
 
 vi.mock("../lib/provider-cache.ts", () => ({
 	loadProviderCache: () => undefined,
 	saveProviderCache: (providerId: string, models: unknown[]) =>
 		mockSaveProviderCache(providerId, models),
+	// The guarded variant delegates to the same recording mock and reports
+	// success: these suites pin call-site behavior, while the guard's own
+	// shrink/empty rules are pinned against the real module in
+	// provider-cache.test.ts and ollama-cache-guard.test.ts.
+	saveProviderCacheGuarded: async (providerId: string, models: unknown[]) => {
+		await mockSaveProviderCache(providerId, models);
+		return true;
+	},
 }));
 
 vi.mock("../lib/probe-cache.ts", () => ({
@@ -49,6 +78,11 @@ vi.mock("../lib/session-start-metrics.ts", () => ({
 vi.mock("../lib/util.ts", () => ({
 	fetchWithRetry: (...args: unknown[]) => mockFetchWithRetry(...args),
 	fetchWithTimeout: (...args: unknown[]) => mockFetchWithTimeout(...args),
+	// Mirror semantics: omit an undefined signal (RequestInit is lib.dom).
+	withSignal: (init: RequestInit, signal?: AbortSignal) => {
+		if (signal) init.signal = signal;
+		return init;
+	},
 }));
 
 vi.mock("../provider-helper.ts", () => ({
@@ -117,6 +151,7 @@ beforeEach(() => {
 	vi.clearAllMocks();
 	mockGetOllamaApiKey.mockReturnValue(undefined);
 	mockGetOllamaShowPaid.mockReturnValue(false);
+	mockGetModelViewOverride.mockReturnValue(undefined);
 	mockGetGlobalFreeOnly.mockReturnValue(true);
 });
 
@@ -233,11 +268,33 @@ describe("Ollama native factory", () => {
 		await ollamaEntry(pi);
 
 		expect(registerProvider).toHaveBeenCalledTimes(1);
-		expect(registerProvider.mock.calls[0][0].id).toBe("ollama-cloud");
+		expect(registerProvider.mock.calls[0]![0].id).toBe("ollama-cloud");
 		expect(registerCommand).toHaveBeenCalledWith(
 			"toggle-ollama-cloud",
 			expect.any(Object),
 		);
 		expect(mockFetchWithRetry).not.toHaveBeenCalled();
+	});
+
+	// Toggle flip/persist behavior is proven live by rpc-toggle-check
+	// (opencode-free); this pins the per-provider wiring (incl. the
+	// provider-id persistence key, not a divergent snake_case key) that
+	// would otherwise go unverified.
+	it("registers the toggle-ollama-cloud command", async () => {
+		const registerProvider = vi.fn();
+		const registerCommand = vi.fn();
+		const on = vi.fn();
+		const pi = {
+			registerProvider,
+			registerCommand,
+			on,
+		} as unknown as ExtensionAPI;
+
+		await ollamaEntry(pi);
+
+		const toggleCommand = registerCommand.mock.calls.find(
+			(call) => call[0] === "toggle-ollama-cloud",
+		);
+		expect(toggleCommand).toBeDefined();
 	});
 });

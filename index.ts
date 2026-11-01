@@ -8,21 +8,10 @@
  * `README.md` for the full provider catalog.
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { setupBuiltInProviderToggles } from "./lib/built-in-toggle.ts";
-import { createLogger } from "./lib/logger.ts";
-import {
-	processQuotaResponse,
-	formatQuotaStatus,
-} from "./lib/quota-monitor.ts";
-import { formatHealthReport } from "./lib/health.ts";
-import {
-	startModelCall,
-	recordModelCall,
-	getAllTelemetry,
-	getTelemetryPath,
-	clearTelemetry,
-} from "./lib/telemetry.ts";
+// MUST be the first import: its module body captures the startup timing
+// origin (performance.now()) at module scope, and ES modules evaluate
+// imports depth-first in declaration order — so the clock starts before any
+// provider module below executes. Do not reorder above/below casually.
 import {
 	beginSessionStart,
 	beginStartup,
@@ -33,6 +22,34 @@ import {
 	startPhase,
 	timeProvider,
 } from "./lib/startup-timing.ts";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+	clearModelViewOverrides,
+	isProviderHidden,
+	setProviderHidden,
+} from "./config.ts";
+import { setupBuiltInProviderToggles } from "./lib/built-in-toggle.ts";
+import { recordAction } from "./lib/action-log.ts";
+import { createLogger, flushLogsSync, withRunId } from "./lib/logger.ts";
+import {
+	processQuotaResponse,
+	formatQuotaStatus,
+} from "./lib/quota-monitor.ts";
+import { fallbackState } from "./lib/fallback-state.ts";
+import { createAutoFallback } from "./lib/auto-fallback/index.ts";
+import { registerAutoFallbackStatusGetter } from "./lib/auto-fallback-status.ts";
+import { formatHealthReport, formatPiAiResolutionLines } from "./lib/health.ts";
+import { logWireSignature } from "./lib/wire-signature.ts";
+import {
+	startModelCall,
+	recordModelCall,
+	getAllTelemetry,
+	getProviderErrorCounts,
+	getTelemetryPath,
+	clearTelemetry,
+	recordPiAiDiagnostics,
+} from "./lib/telemetry.ts";
+import { describePiAiResolution } from "./lib/pi-ai-loader.ts";
 import {
 	applyGlobalFilter,
 	getGlobalFreeOnly,
@@ -40,16 +57,23 @@ import {
 	isFreeModel,
 	registerWithGlobalToggle,
 } from "./lib/registry.ts";
+import { addOpenCodeFreeGateTools, registerGlobTool } from "./lib/glob-tool.ts";
 // Import unique provider extensions (only providers NOT built into pi)
 import cline from "./providers/cline/cline.ts";
-import crofai from "./providers/crofai/crofai.ts";
 import kilo from "./providers/kilo/kilo.ts";
 import llm7 from "./providers/llm7/llm7.ts";
 import deepinfra from "./providers/deepinfra/deepinfra.ts";
 import fastrouter from "./providers/fastrouter/fastrouter.ts";
+import requesty from "./providers/requesty/requesty.ts";
 import stepfun from "./providers/stepfun/stepfun.ts";
+import gmi from "./providers/gmi/gmi.ts";
+import agnes from "./providers/agnes/agnes.ts";
 import sambanova from "./providers/sambanova/sambanova.ts";
 import novita from "./providers/novita/novita.ts";
+import venice from "./providers/venice/venice.ts";
+import infron from "./providers/infron/infron.ts";
+import merge from "./providers/merge/merge.ts";
+import commandcode from "./providers/commandcode/commandcode.ts";
 import routeway from "./providers/routeway/routeway.ts";
 import opengateway from "./providers/opengateway/opengateway.ts";
 import tokenRouter from "./providers/tokenrouter/tokenrouter.ts";
@@ -57,7 +81,8 @@ import ollama from "./providers/ollama/ollama.ts";
 import zenmux from "./providers/zenmux/zenmux.ts";
 import bai from "./providers/bai/bai.ts";
 import anyapi from "./providers/anyapi/anyapi.ts";
-import openmodel from "./providers/openmodel/openmodel.ts";
+import orcarouter from "./providers/orcarouter/orcarouter.ts";
+import xkiro from "./providers/xkiro/xkiro.ts";
 import qoder from "./providers/qoder/qoder.ts";
 
 /**
@@ -73,19 +98,26 @@ const UNIQUE_PROVIDERS: ReadonlyArray<(pi: ExtensionAPI) => Promise<void>> = [
 	ollama,
 	cline,
 	zenmux,
-	crofai,
 	llm7,
 	deepinfra,
 	sambanova,
 	novita,
+	venice,
+	infron,
+	merge,
+	commandcode,
 	fastrouter,
+	requesty,
 	stepfun,
+	gmi,
+	agnes,
 	routeway,
 	opengateway,
 	tokenRouter,
 	anyapi,
 	bai,
-	openmodel,
+	orcarouter,
+	xkiro,
 	qoder,
 ];
 
@@ -96,16 +128,17 @@ const _logger = createLogger("pi-free");
 // =============================================================================
 
 /**
- * Module-level flag that prevents global event handlers from being registered
- * more than once. When the extension host reloads an extension it calls the
- * default export again in the same module scope, which would otherwise cause
- * handlers registered by setupQuotaMonitoring() and setupTelemetry() to
- * accumulate and fire multiple times per event.
+ * ExtensionAPI identity that global event handlers were last registered for.
  *
- * pi.on() returns void (no unsubscribe function), so the only safe guard is
- * skipping re-registration on the second and subsequent calls.
+ * A reload creates a NEW runner (fresh ExtensionAPI) while this module's state
+ * can survive — the same host behavior lib/built-in-toggle.ts and
+ * lib/native-provider.ts key their guards on. The new runner must receive the
+ * handlers again or it would run with no /toggle-free, /free-providers, quota
+ * monitoring, or telemetry at all. Guarding on identity keeps same-runner
+ * re-entry (which would otherwise accumulate duplicate pi.on() handlers —
+ * pi.on() is additive with no unsubscribe API) from double-registering.
  */
-let _handlersRegistered = false;
+let handlersRegisteredFor: ExtensionAPI | undefined;
 
 // =============================================================================
 // Global Commands
@@ -116,34 +149,116 @@ function setupGlobalCommands(pi: ExtensionAPI) {
 	pi.registerCommand("toggle-free", {
 		description: "Toggle global free-only mode for all providers",
 		handler: async (_args, ctx) => {
-			const current = getGlobalFreeOnly();
-			const next = !current;
-			applyGlobalFilter(next, { force: true });
-
-			const registry = getProviderRegistry();
-			const providerCount = registry.size;
-
-			if (next) {
-				const totalFree = [...registry.values()].reduce(
-					(sum, e) => sum + e.stored.free.length,
-					0,
-				);
-				ctx.ui.notify(
-					`Free-only mode: ON (${totalFree} free models across ${providerCount} providers)`,
-					"info",
-				);
-			} else {
-				const totalAll = [...registry.values()].reduce(
-					(sum, e) => sum + (e.stored.all.length || e.stored.free.length),
-					0,
-				);
-				ctx.ui.notify(
-					`Free-only mode: OFF (all ${totalAll} models visible across ${providerCount} providers)`,
-					"info",
-				);
-			}
+			// One run tag for the whole fan-out; the action ring keeps the
+			// user-pasteable summary (file log carries the per-provider trace).
+			withRunId(() => {
+				void runGlobalToggle(ctx);
+			});
 		},
 	});
+
+	// /toggle-free body, extracted so the whole fan-out shares one run tag.
+	async function runGlobalToggle(ctx: {
+		ui: {
+			notify(message: string, type?: "info" | "warning" | "error"): void;
+		};
+	}): Promise<void> {
+		const current = getGlobalFreeOnly();
+		const next = !current;
+		// Clear per-provider choices first so every provider follows
+		// the new global default — a stale explicit choice must not keep
+		// fighting the global flag on every new session (#510).
+		await clearModelViewOverrides();
+		applyGlobalFilter(next);
+
+		const registry = getProviderRegistry();
+		const providerCount = registry.size;
+
+		if (next) {
+			const totalFree = [...registry.values()].reduce(
+				(sum, e) => sum + e.stored.free.length,
+				0,
+			);
+			ctx.ui.notify(
+				`Free-only mode: ON (${totalFree} free models across ${providerCount} providers)`,
+				"info",
+			);
+		} else {
+			const totalAll = [...registry.values()].reduce(
+				(sum, e) => sum + (e.stored.all.length || e.stored.free.length),
+				0,
+			);
+			ctx.ui.notify(
+				`Free-only mode: OFF (all ${totalAll} models visible across ${providerCount} providers)`,
+				"info",
+			);
+		}
+		recordAction(
+			"toggle",
+			`global free-only ${current ? "ON→OFF" : "OFF→ON"} (${providerCount} providers)`,
+		);
+	}
+
+	// /hide-provider <id> — hide every model of one provider (#572).
+	// The models stay configured; they vanish from the picker until
+	// /show-provider restores them. One shared store with per-model
+	// hidden_models, so both share the cross-process config lock.
+	pi.registerCommand("hide-provider", {
+		description: "Hide all models of a provider (usage: /hide-provider <id>)",
+		handler: async (args, ctx) => {
+			await setProviderVisibility(args, true, ctx);
+		},
+	});
+
+	// /show-provider <id> — reveal a provider hidden by /hide-provider.
+	pi.registerCommand("show-provider", {
+		description: "Show all models of a provider (usage: /show-provider <id>)",
+		handler: async (args, ctx) => {
+			await setProviderVisibility(args, false, ctx);
+		},
+	});
+
+	async function setProviderVisibility(
+		args: string,
+		hidden: boolean,
+		ctx: {
+			ui: {
+				notify(message: string, type?: "info" | "warning" | "error"): void;
+			};
+		},
+	): Promise<void> {
+		const providerId = args.trim().split(/\s+/u)[0] ?? "";
+		if (!providerId) {
+			ctx.ui.notify(
+				`Usage: /${hidden ? "hide" : "show"}-provider <provider-id>`,
+				"warning",
+			);
+			return;
+		}
+		if (!getProviderRegistry().has(providerId)) {
+			ctx.ui.notify(`Unknown provider: ${providerId}`, "warning");
+			return;
+		}
+		if (isProviderHidden(providerId) === hidden) {
+			ctx.ui.notify(
+				`${providerId} is already ${hidden ? "hidden" : "visible"}`,
+				"info",
+			);
+			return;
+		}
+		await setProviderHidden(providerId, hidden);
+		// Re-apply the current view so the change is live: native providers
+		// re-run filterModels (which calls applyHidden) on invalidate.
+		applyGlobalFilter(getGlobalFreeOnly());
+		ctx.ui.notify(
+			`${providerId}: ${hidden ? "hidden from the model picker" : "visible again"}`,
+			"info",
+		);
+		recordAction(
+			"toggle",
+			`provider ${providerId} ${hidden ? "hidden" : "shown"}`,
+		);
+	}
 
 	// /free-providers - Show free model counts by provider
 	pi.registerCommand("free-providers", {
@@ -243,6 +358,28 @@ function setupGlobalCommands(pi: ExtensionAPI) {
 			}
 
 			lines.push("", `File: ${getTelemetryPath()}`);
+
+			// M2 (#437): aggregate auth-failure counts (401/403) per provider from
+			// recorded telemetry — status classes only, never error bodies.
+			const authFailures = getProviderErrorCounts();
+			const authLines: string[] = [];
+			for (const [provider, counts] of authFailures) {
+				const total =
+					counts["401"] + counts["403"] + counts["429"] + counts["5xx"];
+				if (total === 0) continue;
+				authLines.push(
+					`  ${provider}: 401×${counts["401"]}, 403×${counts["403"]}, 429×${counts["429"]}, 5xx×${counts["5xx"]}`,
+				);
+			}
+			if (authLines.length > 0) {
+				lines.push("", "Failures by class:", ...authLines);
+			}
+
+			// pi-ai resolution (#585): the install-layout diagnosis that a stack
+			// trace alone never carried (#581/#510/#448). Live probe, same
+			// formatter as /pi-free-health so the two cannot drift.
+			lines.push("", ...formatPiAiResolutionLines(describePiAiResolution()));
+
 			ctx.ui.notify(lines.join("\n"), "info");
 		},
 	});
@@ -255,13 +392,21 @@ function setupGlobalCommands(pi: ExtensionAPI) {
 			ctx.ui.notify("Telemetry data cleared", "info");
 		},
 	});
-
 	// /pi-free-health — Show a credential-free diagnostic report and log path
 	pi.registerCommand("pi-free-health", {
 		description:
 			"Show pi-free health, startup issues, and the diagnostic log path",
 		handler: async (_args, ctx) => {
 			ctx.ui.notify(formatHealthReport(), "info");
+			// Refreshing the durable record here means a user who pastes health
+			// output has also written the resolution state to the telemetry file,
+			// where it survives the process. Detached: the report must not wait
+			// on disk I/O.
+			recordPiAiDiagnostics(describePiAiResolution()).catch((error) => {
+				_logger.debug("pi-ai diagnostics recording failed", {
+					error: String(error),
+				});
+			});
 		},
 	});
 
@@ -289,7 +434,16 @@ function setupQuotaMonitoring(pi: ExtensionAPI) {
 				const providerId = ctx.model?.provider;
 				if (!providerId) return;
 
-				processQuotaResponse(providerId, event.headers);
+				processQuotaResponse(providerId, event.status, event.headers);
+
+				// Mirror the status into fallback-state so the abort
+				// heuristic (Q23 = B) can read it. We deliberately do not
+				// read response bodies — header names + status only
+				// (AGENTS.md convention 17, wire-signature).
+				const modelId = ctx.model?.id;
+				if (modelId) {
+					fallbackState.recordResponse(providerId, modelId, event.status);
+				}
 
 				// Update status bar with quota for the active provider
 				const status = formatQuotaStatus(providerId);
@@ -338,6 +492,16 @@ function setupTelemetry(pi: ExtensionAPI) {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	(pi as any).on("before_agent_start", (_event: any, ctx: any) => {
 		if (!ctx.model) return;
+
+		// M3 (#437): wire-signature debug log — the request contract pi-free
+		// hands pi-ai at agent start. REDACTION RULE: header NAMES only, never
+		// values — an Authorization/apiKey/token value in this line would leak
+		// credentials into the shared ~/.pi/free.log. Debug-only so normal runs
+		// don't spam the log.
+		logWireSignature(ctx.model, (providerId) =>
+			ctx.modelRegistry?.getProvider?.(providerId),
+		);
+
 		if (!isFreeModel(ctx.model as any)) return;
 		const provider = ctx.model?.provider;
 		const model = ctx.model?.id;
@@ -416,6 +580,30 @@ function setupTelemetry(pi: ExtensionAPI) {
 }
 
 // =============================================================================
+// Auto-Fallback
+// =============================================================================
+
+// Module-scope handle so `/pi-free-health` can read its status without
+// re-constructing the pipeline. Reset on each piFreeEntry() so a reload
+// gets fresh state (and fresh event registrations).
+let autoFallback: ReturnType<typeof createAutoFallback> | undefined;
+
+/**
+ * The factory is intentionally not invoked until after the global handlers
+ * are registered — auto-fallback's event subscribers must use the SAME
+ * `pi` instance that the runner owns, otherwise the ExtensionAPI's
+ * additive `pi.on()` semantics leak duplicate handlers.
+ */
+function setupAutoFallback(pi: ExtensionAPI): void {
+	autoFallback = createAutoFallback();
+	autoFallback.register(pi);
+	// Health reads the handle through the registration module (not a
+	// direct import of this file) to keep the dependency direction
+	// index -> health one-way.
+	registerAutoFallbackStatusGetter(() => autoFallback);
+}
+
+// =============================================================================
 // Main Entry Point
 // =============================================================================
 
@@ -426,20 +614,35 @@ export default async function piFreeEntry(pi: ExtensionAPI) {
 	const globalFreeOnly = getGlobalFreeOnly();
 	_logger.info(`[pi-free] Initializing (global free-only: ${globalFreeOnly})`);
 
-	// Guard: only register global event handlers once per module lifetime.
-	// On extension reload the module scope is preserved but this function is
-	// called again, which would accumulate duplicate handlers for quota
-	// monitoring and telemetry. Commands and provider registrations are
-	// idempotent (the runtime replaces them), but pi.on() is additive with
-	// no unsubscribe API, so we skip the registration block entirely on
-	// subsequent calls.
+	// Guard: register global event handlers once per runner (ExtensionAPI).
+	// On extension reload the module scope is preserved but a new runner calls
+	// this function, so it must receive fresh registrations; same-runner
+	// re-entry would accumulate duplicate handlers for quota monitoring and
+	// telemetry. Commands and provider registrations are idempotent (the
+	// runtime replaces them), but pi.on() is additive with no unsubscribe API,
+	// so we skip the registration block when this runner already has them.
 	startPhase("global-handlers");
-	if (!_handlersRegistered) {
-		_handlersRegistered = true;
+	if (handlersRegisteredFor === pi) {
+		_logger.info(
+			"[pi-free] Skipping global handler registration (already registered for this runner)",
+		);
+	} else {
+		handlersRegisteredFor = pi;
 
 		// Start a fresh observability window before any provider session_start
 		// handlers run. The handler is synchronous and never blocks Pi.
-		pi.on("session_start", () => beginSessionStart());
+		pi.on("session_start", () => {
+			beginSessionStart();
+			// pi-ai resolution diagnostics (#585): record what this install
+			// resolved, once per session, so a mid-session install change shows up.
+			// Measured at ~0.3ms of filesystem probes and no pi-ai import; the
+			// write itself is detached, keeping the handler synchronous.
+			recordPiAiDiagnostics(describePiAiResolution()).catch((error) => {
+				_logger.debug("pi-ai diagnostics recording failed", {
+					error: String(error),
+				});
+			});
+		});
 
 		// Setup global commands first
 		setupGlobalCommands(pi);
@@ -449,10 +652,20 @@ export default async function piFreeEntry(pi: ExtensionAPI) {
 
 		// Setup model telemetry (tracks real-world performance)
 		setupTelemetry(pi);
-	} else {
-		_logger.info(
-			"[pi-free] Skipping global handler registration (already registered)",
-		);
+
+		// Setup auto-fallback (event-driven model switching on errors)
+		setupAutoFallback(pi);
+
+		// Expose Pi's file finder as `glob`, and present the OpenCode Zen
+		// free-tier gate tool names on opencode-free turns only (issue #544).
+		// Registered once per runner with the others; both are guarded by the
+		// same `handlersRegisteredFor` identity check above. The host package
+		// import is lazy, so a production-shaped tree without the optional
+		// peer still loads (registerGlobTool returns false there).
+		await registerGlobTool(pi, process.cwd());
+		pi.on("before_agent_start", (event, ctx) => {
+			addOpenCodeFreeGateTools(event, ctx.model?.provider);
+		});
 	}
 	endPhase("global-handlers");
 
@@ -485,6 +698,10 @@ export default async function piFreeEntry(pi: ExtensionAPI) {
 	// Finalize timing and emit the observability summary (best-effort).
 	finalizeStartup();
 	logStartupSummary();
+	// Pi's main.js calls process.exit(0) right after startup, which would
+	// drop the logger's buffered async writes; flush everything logged so far
+	// to disk synchronously so the startup summary line survives (best-effort).
+	flushLogsSync();
 
 	const registry = getProviderRegistry();
 	_logger.info(`[pi-free] Loaded with ${registry.size} providers`);

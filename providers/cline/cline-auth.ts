@@ -10,6 +10,9 @@
  */
 
 import * as http from "node:http";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { URL as NodeURL } from "node:url";
 import type {
 	ApiKeyAuth,
@@ -25,7 +28,12 @@ import type {
 	ProviderAuth,
 } from "@earendil-works/pi-ai/compat";
 import { getClineApiKey } from "../../config.ts";
-import { BASE_URL_CLINE, CLINE_AUTH_TIMEOUT_MS } from "../../constants.ts";
+import {
+	BASE_URL_CLINE,
+	CLINE_AUTH_TIMEOUT_MS,
+	CLINE_EXTENSION_VERSION,
+	VS_CODE_VERSION,
+} from "../../constants.ts";
 import { createLogger } from "../../lib/logger.ts";
 
 const logger = createLogger("cline-auth");
@@ -38,8 +46,6 @@ const AUTH_PATH = "/auth";
 
 // =============================================================================
 // Headers (must match real Cline VS Code extension exactly)
-const VS_CODE_VERSION = "1.109.3";
-const CLINE_EXTENSION_VERSION = "3.76.0";
 
 function buildClineHeaders(): Record<string, string> {
 	return {
@@ -218,11 +224,20 @@ font-family:system-ui,sans-serif;background:#fff;color:#333}
 // Auth URL fetching
 // =============================================================================
 
+const ALLOWED_CLINE_AUTH_HOSTS = new Set(["api.cline.bot"]);
+
 async function fetchAuthorizeUrl(
 	callbackUrl: string,
 	signal?: AbortSignal,
 ): Promise<string> {
 	const authUrl = new NodeURL("auth/authorize", `${BASE_URL_CLINE}/`);
+	// Allowlist the outbound host: the authorize request must only ever target
+	// the pinned Cline API host, never a caller-influenced URL.
+	if (!ALLOWED_CLINE_AUTH_HOSTS.has(authUrl.hostname)) {
+		throw new Error(
+			`Cline auth URL host ${authUrl.hostname} is not on the allowlist`,
+		);
+	}
 	authUrl.searchParams.set("client_type", "extension");
 	authUrl.searchParams.set("callback_url", callbackUrl);
 	authUrl.searchParams.set("redirect_uri", callbackUrl);
@@ -231,6 +246,11 @@ async function fetchAuthorizeUrl(
 	const timeout = setTimeout(() => controller.abort(), 8000);
 
 	try {
+		// pi-lens-ignore: ts-ssrf — false positive: authUrl is built solely from
+		// the compile-time BASE_URL_CLINE constant and its hostname is verified
+		// against ALLOWED_CLINE_AUTH_HOSTS immediately above; callbackUrl only
+		// feeds query parameters, never the request target.
+		// pi-lens-ignore: ts-ssrf
 		const res = await fetch(authUrl.toString(), {
 			method: "GET",
 			redirect: "manual",
@@ -256,6 +276,7 @@ async function fetchAuthorizeUrl(
 	} catch (error) {
 		throw new Error(
 			`Authentication request failed: ${error instanceof Error ? error.message : "unknown error"}`,
+			{ cause: error },
 		);
 	} finally {
 		clearTimeout(timeout);
@@ -349,12 +370,15 @@ async function exchangeCodeForTokens(
 		};
 		if (candidate) payload.provider = candidate;
 
-		const res = await fetch(`${BASE_URL_CLINE}/auth/token`, {
+		// RequestInit is lib.dom (no undefined members): omit signal
+		// instead of assigning undefined.
+		const tokenInit: RequestInit = {
 			method: "POST",
 			headers: buildClineHeaders(),
 			body: JSON.stringify(payload),
-			signal,
-		});
+		};
+		if (signal) tokenInit.signal = signal;
+		const res = await fetch(`${BASE_URL_CLINE}/auth/token`, tokenInit);
 
 		if (!res.ok) {
 			lastError = `${res.status}: ${(await res.text().catch(() => "")).slice(0, 120)}`;
@@ -501,6 +525,7 @@ export async function refreshClineToken(
 			});
 			throw new Error(
 				"Cline token refresh failed. Run /login cline to re-authenticate.",
+				{ cause: secondErr },
 			);
 		}
 	}
@@ -531,12 +556,16 @@ export function toApiKey(credentials: OAuthCredentials): string {
 export async function loginClineNative(
 	interaction: AuthInteraction,
 ): Promise<OAuthCredential> {
-	const credential = await loginCline({
+	// OAuthLoginCallbacks is Pi-owned (no undefined members): omit
+	// signal/instructions/placeholder instead of assigning undefined.
+	const callbacks: OAuthLoginCallbacks = {
 		onAuth: (info) =>
 			interaction.notify({
 				type: "auth_url",
 				url: info.url,
-				instructions: info.instructions,
+				...(info.instructions !== undefined
+					? { instructions: info.instructions }
+					: {}),
 			}),
 		onDeviceCode: (info) =>
 			interaction.notify({ type: "device_code", ...info }),
@@ -544,7 +573,9 @@ export async function loginClineNative(
 			interaction.prompt({
 				type: "text",
 				message: prompt.message,
-				placeholder: prompt.placeholder,
+				...(prompt.placeholder !== undefined
+					? { placeholder: prompt.placeholder }
+					: {}),
 			}),
 		onProgress: (message) => interaction.notify({ type: "progress", message }),
 		onManualCodeInput: () =>
@@ -558,8 +589,9 @@ export async function loginClineNative(
 				message: prompt.message,
 				options: prompt.options,
 			}),
-		signal: interaction.signal,
-	});
+	};
+	if (interaction.signal) callbacks.signal = interaction.signal;
+	const credential = await loginCline(callbacks);
 	return { ...credential, type: "oauth" };
 }
 
@@ -593,18 +625,72 @@ export async function refreshClineCredential(
  * `apiKey.check`: Pi runs that check before `filterModels` and would hide this
  * intentionally public catalog when the user is logged out.
  */
+// =============================================================================
+// Cline CLI credential fallback
+// =============================================================================
+
+/** Cline CLI's provider settings store (auth.json on other platforms). */
+const CLINE_CLI_PROVIDERS_PATH = join(
+	homedir(),
+	".cline",
+	"data",
+	"settings",
+	"providers.json",
+);
+
+/**
+ * Best-effort read of the durable Cline API key from the Cline CLI's
+ * `providers.json` (structure: `providers["cline"]/["cline-pass"].settings.apiKey`).
+ * Used only as a fallback so `cline auth` users get zero-config login in
+ * pi-free without re-entering a key. Silently returns undefined on any error
+ * (missing/malformed file) — credential failures must never break auth.
+ *
+ * NOTE: the CLI also stores short-lived WorkOS `settings.auth.accessToken`s;
+ * those are deliberately NOT read here because refreshing them is owned by
+ * Pi's native OAuth lifecycle, not the apiKey.resolve path.
+ */
+export function readClineCliApiKey(
+	providersPath: string = CLINE_CLI_PROVIDERS_PATH,
+): string | undefined {
+	try {
+		if (!providersPath || !existsSync(providersPath)) return undefined;
+		const raw = JSON.parse(readFileSync(providersPath, "utf8")) as {
+			providers?: Record<
+				string,
+				{ settings?: { apiKey?: unknown } } | undefined
+			>;
+		};
+		for (const name of ["cline-pass", "cline"] as const) {
+			const apiKey = raw.providers?.[name]?.settings?.apiKey;
+			if (typeof apiKey === "string" && apiKey.length > 0) return apiKey;
+		}
+	} catch {
+		// Best-effort: malformed or unreadable CLI config must not fail auth.
+	}
+	return undefined;
+}
+
+/**
+ * Resolve the effective Cline API key: a natively-stored key wins, then the
+ * ambient `CLINE_API_KEY` env var / `~/.pi/free.json` value, then the Cline
+ * CLI's durable API key (`~/.cline/data/settings/providers.json`).
+ */
 async function resolveClineApiKey(input: {
 	ctx: AuthContext;
 	credential?: ApiKeyCredential;
 	signal?: AbortSignal;
 }): Promise<AuthResult | undefined> {
-	const key = input.credential?.key ?? getClineApiKey();
+	const key = input.credential?.key ?? getClineApiKey() ?? readClineCliApiKey();
 	if (!key) {
 		return { auth: {}, source: "public catalog (no account)" };
 	}
 	return {
 		auth: { apiKey: key },
-		source: input.credential?.key ? "stored API key" : "CLINE_API_KEY",
+		source: input.credential?.key
+			? "stored API key"
+			: getClineApiKey()
+				? "CLINE_API_KEY"
+				: "Cline CLI",
 	};
 }
 

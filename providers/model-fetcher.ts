@@ -33,17 +33,24 @@ interface OpenRouterCompatibleModel {
 
 interface FetchModelsOptions {
 	/** Provider id for scoped models.dev enrichment (e.g., openrouter, kilo). */
-	providerId?: string;
+	providerId?: string | undefined;
 	/** Base URL for the API (e.g., https://api.openrouter.ai/api/v1) */
 	baseUrl: string;
 	/** API key for authentication (optional) */
-	apiKey?: string;
+	apiKey?: string | undefined;
 	/** Only return free models (pricing === 0) */
-	freeOnly?: boolean;
+	freeOnly?: boolean | undefined;
+	/**
+	 * Drop models whose `architecture.output_modalities` include ANY of these
+	 * modalities, even when "text" is also present (e.g. image-generation
+	 * hybrids like gemini-flash-image). Unlike the default text-output check,
+	 * this never keeps such models for chat use.
+	 */
+	excludeOutputModalities?: string[];
 	/** Additional headers to include */
 	extraHeaders?: Record<string, string>;
 	/** Abort signal owned by the native provider refresh lifecycle. */
-	signal?: AbortSignal;
+	signal?: AbortSignal | undefined;
 	/** Number of retries for failed requests */
 	retries?: number;
 	/** Delay between retries in ms */
@@ -61,6 +68,7 @@ export async function fetchOpenRouterCompatibleModels(
 		baseUrl,
 		apiKey,
 		freeOnly = false,
+		excludeOutputModalities,
 		extraHeaders = {},
 		retries = 3,
 		retryDelay = 1000,
@@ -110,6 +118,14 @@ export async function fetchOpenRouterCompatibleModels(
 			const outputMods = m.architecture?.output_modalities ?? [];
 			if (outputMods.length > 0 && !outputMods.includes("text")) return false;
 
+			// Stricter capability exclusion for providers whose free views must
+			// not contain media-generation hybrids (image+text output etc.).
+			if (
+				excludeOutputModalities &&
+				outputMods.some((mod) => excludeOutputModalities.includes(mod))
+			)
+				return false;
+
 			// Filter by provider flag when available, otherwise pricing.
 			if (freeOnly) {
 				if (typeof m.isFree === "boolean") return m.isFree;
@@ -122,27 +138,7 @@ export async function fetchOpenRouterCompatibleModels(
 		})
 		.map(mapOpenRouterModel);
 
-	return await safeEnrichModelsWithModelsDev(models, {
+	return safeEnrichModelsWithModelsDev(models, {
 		providerId: options.providerId,
 	});
-}
-
-/**
- * Fetch both free and all models in a single call.
- * Returns separate arrays for free and paid models.
- */
-export async function fetchOpenRouterModelsWithFree(
-	options: Omit<FetchModelsOptions, "freeOnly">,
-): Promise<{ free: ProviderModelConfig[]; all: ProviderModelConfig[] }> {
-	const all = await fetchOpenRouterCompatibleModels({
-		...options,
-		freeOnly: false,
-	});
-
-	const free = all.filter((m) => {
-		const cost = m.cost;
-		return cost != null && cost.input === 0 && cost.output === 0;
-	});
-
-	return { free, all };
 }

@@ -22,12 +22,20 @@ const mockGetKiloApiKey = vi.hoisted(() =>
 	vi.fn((): string | undefined => undefined),
 );
 const mockGetKiloShowPaid = vi.hoisted(() => vi.fn(() => false));
+const mockGetModelViewOverride = vi.hoisted(() =>
+	vi.fn((_providerId: string): "free" | "all" | undefined => undefined),
+);
+const mockSetModelViewOverride = vi.hoisted(() => vi.fn());
 const mockGetKiloFreeOnly = vi.hoisted(() => vi.fn(() => false));
 const mockGetGlobalFreeOnly = vi.hoisted(() => vi.fn(() => true));
 
 vi.mock("../config.ts", () => ({
 	getKiloApiKey: () => mockGetKiloApiKey(),
 	getKiloShowPaid: () => mockGetKiloShowPaid(),
+	getModelViewOverride: (providerId: string) =>
+		mockGetModelViewOverride(providerId),
+	setModelViewOverride: (...args: unknown[]) =>
+		mockSetModelViewOverride(...args),
 	getKiloFreeOnly: () => mockGetKiloFreeOnly(),
 	applyHidden: (models: unknown[]) => models,
 	PROVIDER_KILO: "kilo",
@@ -35,7 +43,11 @@ vi.mock("../config.ts", () => ({
 
 vi.mock("../lib/registry.ts", () => ({
 	getGlobalFreeOnly: () => mockGetGlobalFreeOnly(),
-	getGlobalFreeOnlyForced: () => false,
+	// Mirrors the real resolveModelView over the mocked config getters (the
+	// real rule is unit-tested in registry-provider-overrides.test.ts).
+	resolveModelView: (providerId: string) =>
+		mockGetModelViewOverride(providerId) ??
+		(mockGetKiloShowPaid() ? "all" : mockGetGlobalFreeOnly() ? "free" : "all"),
 	isFreeModel: (m: { cost?: { input?: number } }) => (m.cost?.input ?? 0) === 0,
 }));
 
@@ -132,6 +144,7 @@ beforeEach(() => {
 	mockFetchKiloCatalog.mockReset();
 	mockGetKiloApiKey.mockReturnValue(undefined);
 	mockGetKiloShowPaid.mockReturnValue(false);
+	mockGetModelViewOverride.mockReturnValue(undefined);
 	mockGetKiloFreeOnly.mockReturnValue(false);
 	mockGetGlobalFreeOnly.mockReturnValue(true);
 });
@@ -226,6 +239,9 @@ describe("refreshModels offline init", () => {
 
 describe("refreshModels online", () => {
 	it("fetches, persists to the store, and publishes models", async () => {
+		// All-view: pins persist mechanics, not view filtering.
+		mockGetModelViewOverride.mockReturnValue("all");
+
 		mockFetchKiloCatalog.mockResolvedValue({
 			all: [freeCfg("a"), paidCfg("b")],
 			free: [freeCfg("a")],
@@ -238,12 +254,14 @@ describe("refreshModels online", () => {
 		expect(mockFetchKiloCatalog).toHaveBeenCalledTimes(1);
 		// Store persisted exactly once with the full catalog.
 		expect(written).toHaveLength(1);
-		expect(written[0].models.map((m) => m.id).sort()).toEqual(["a", "b"]);
-		expect(typeof written[0].checkedAt).toBe("number");
+		expect(written[0]!.models.map((m) => m.id).sort()).toEqual(["a", "b"]);
+		expect(typeof written[0]!.checkedAt).toBe("number");
 		// Catalogs populated for the toggle.
 		expect(stored.all).toHaveLength(2);
 		expect(stored.free).toHaveLength(1);
-		// getModels exposes the complete catalog; Pi applies filterModels.
+		// getModels exposes the complete catalog; Pi applies filterModels
+		// under the free view resolved live below.
+		mockGetModelViewOverride.mockReturnValue(undefined);
 		expect(
 			provider
 				.getModels()
@@ -303,6 +321,24 @@ describe("refreshModels online", () => {
 		);
 	});
 
+	it("fetches the public catalog with no token when nothing is configured (#421)", async () => {
+		mockGetKiloApiKey.mockReturnValue(undefined);
+		mockFetchKiloCatalog.mockResolvedValue({
+			all: [freeCfg("public")],
+			free: [freeCfg("public")],
+		});
+		const { store, written } = makeStore();
+		const { provider } = createKiloProvider();
+
+		await provider.refreshModels?.(ctx({ store, allowNetwork: true }));
+
+		expect(mockFetchKiloCatalog).toHaveBeenCalledWith(
+			expect.objectContaining({ token: undefined }),
+		);
+		expect(written).toHaveLength(1);
+		expect(provider.getModels().map((m) => m.id)).toEqual(["public"]);
+	});
+
 	it("retains the previous catalog when a fetch returns nothing (poisoning guard)", async () => {
 		const seeded = {
 			models: [
@@ -360,49 +396,10 @@ describe("toggle interop", () => {
 		return handle;
 	}
 
-	it("keeps the full catalog while filterModels selects the free view", async () => {
-		const { provider } = await seededProvider();
-		expect(
-			provider
-				.getModels()
-				.map((m) => m.id)
-				.sort(),
-		).toEqual(["a", "b"]);
-		expect(
-			provider.filterModels!(provider.getModels(), undefined).map((m) => m.id),
-		).toEqual(["a"]);
-
-		expect(
-			provider
-				.getModels()
-				.map((m) => m.id)
-				.sort(),
-		).toEqual(["a", "b"]);
-		expect(
-			provider.filterModels!(provider.getModels(), undefined).map((m) => m.id),
-		).toEqual(["a"]);
-	});
-
-	it("decideView shows all when per-provider show_paid is set under global free-only", async () => {
-		mockGetKiloShowPaid.mockReturnValue(true);
-		const { provider } = await seededProvider();
-		// show_paid true + global free-only true => filterModels returns all.
-		expect(
-			provider.filterModels!(provider.getModels(), undefined)
-				.map((m) => m.id)
-				.sort(),
-		).toEqual(["a", "b"]);
-	});
-
-	it("filterModels shows all when global free-only is off", async () => {
-		mockGetGlobalFreeOnly.mockReturnValue(false);
-		const { provider } = await seededProvider();
-		expect(
-			provider.filterModels!(provider.getModels(), undefined)
-				.map((m) => m.id)
-				.sort(),
-		).toEqual(["a", "b"]);
-	});
+	// NOTE (RPC migration): filter-view behavior is proven live by
+	// rpc-session-check (managed zero-paid + toggle phases incl.
+	// persistence). The kilo_free_only escape hatch below has no live
+	// equivalent and stays.
 
 	it("filterModels forces free when kilo_free_only is set", async () => {
 		mockGetKiloFreeOnly.mockReturnValue(true);

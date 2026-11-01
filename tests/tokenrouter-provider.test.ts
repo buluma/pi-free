@@ -9,26 +9,48 @@ const mockGetTokenrouterApiKey = vi.hoisted(() =>
 	vi.fn((): string | undefined => undefined),
 );
 const mockGetTokenrouterShowPaid = vi.hoisted(() => vi.fn(() => false));
+const mockGetModelViewOverride = vi.hoisted(() =>
+	vi.fn((_providerId: string): "free" | "all" | undefined => undefined),
+);
+const mockSetModelViewOverride = vi.hoisted(() => vi.fn());
 const mockGetGlobalFreeOnly = vi.hoisted(() => vi.fn(() => true));
 const mockFetchWithRetry = vi.hoisted(() => vi.fn());
 
 vi.mock("../config.ts", () => ({
 	getTokenrouterApiKey: () => mockGetTokenrouterApiKey(),
 	getTokenrouterShowPaid: () => mockGetTokenrouterShowPaid(),
+	isOhMyPiCompat: () => false,
+	getModelViewOverride: (providerId: string) =>
+		mockGetModelViewOverride(providerId),
+	setModelViewOverride: (...args: unknown[]) =>
+		mockSetModelViewOverride(...args),
 	applyHidden: (models: unknown[]) => models,
 	saveConfig: vi.fn(),
 }));
 
 vi.mock("../lib/registry.ts", () => ({
 	getGlobalFreeOnly: () => mockGetGlobalFreeOnly(),
-	getGlobalFreeOnlyForced: () => false,
-	isFreeModel: (model: { id: string }) => model.id.endsWith(":free"),
+	// Mirrors the real resolveModelView over the mocked config getters (the
+	// real rule is unit-tested in registry-provider-overrides.test.ts).
+	resolveModelView: (providerId: string) =>
+		mockGetModelViewOverride(providerId) ??
+		(mockGetTokenrouterShowPaid()
+			? "all"
+			: mockGetGlobalFreeOnly()
+				? "free"
+				: "all"),
+	isFreeModel: (m: { id: string }) => m.id.endsWith(":free"),
 	registerWithGlobalToggle: vi.fn(),
 }));
 
 vi.mock("../lib/util.ts", () => ({
 	cleanModelName: (id: string) => id,
 	fetchWithRetry: (...args: unknown[]) => mockFetchWithRetry(...args),
+	// Mirror semantics: omit an undefined signal (RequestInit is lib.dom).
+	withSignal: (init: RequestInit, signal?: AbortSignal) => {
+		if (signal) init.signal = signal;
+		return init;
+	},
 }));
 
 vi.mock("../lib/model-metadata.ts", () => ({
@@ -61,9 +83,12 @@ vi.mock("../lib/logger.ts", () => ({
 }));
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createAssistantMessageEventStream } from "../lib/assistant-message-event-stream.ts";
+import { __setCompatLoaderForTests } from "../lib/lazy-compat.ts";
 import { tokenRouterAuth } from "../providers/tokenrouter/tokenrouter-auth.ts";
 import tokenRouterEntry, {
 	createTokenRouterProvider,
+	normalizeTokenRouterRequestPayload,
 } from "../providers/tokenrouter/tokenrouter.ts";
 
 function makeStore(seed?: ModelsStoreEntry): {
@@ -116,7 +141,7 @@ function model(id: string, paid = false) {
 		},
 		contextWindow: 128_000,
 		maxTokens: 16_384,
-		api: "tokenrouter-openai-completions",
+		api: "openai-completions",
 		provider: "tokenrouter",
 		baseUrl: "https://api.tokenrouter.com/v1",
 	};
@@ -126,6 +151,7 @@ beforeEach(() => {
 	vi.clearAllMocks();
 	mockGetTokenrouterApiKey.mockReturnValue(undefined);
 	mockGetTokenrouterShowPaid.mockReturnValue(false);
+	mockGetModelViewOverride.mockReturnValue(undefined);
 	mockGetGlobalFreeOnly.mockReturnValue(true);
 });
 
@@ -265,11 +291,124 @@ describe("TokenRouter native factory", () => {
 		await tokenRouterEntry(pi);
 
 		expect(registerProvider).toHaveBeenCalledTimes(1);
-		expect(registerProvider.mock.calls[0][0].id).toBe("tokenrouter");
+		expect(registerProvider.mock.calls[0]![0].id).toBe("tokenrouter");
 		expect(registerCommand).toHaveBeenCalledWith(
 			"toggle-tokenrouter",
 			expect.any(Object),
 		);
 		expect(mockFetchWithRetry).not.toHaveBeenCalled();
+	});
+
+	it("before_provider_request returns the adaptive-patched MiniMax payload", async () => {
+		const registerProvider = vi.fn();
+		const registerCommand = vi.fn();
+		const on = vi.fn();
+		const pi = {
+			registerProvider,
+			registerCommand,
+			on,
+		} as unknown as ExtensionAPI;
+
+		await tokenRouterEntry(pi);
+
+		// The runner replaces the request payload with the handler's return
+		// value, so a hook that only calls the patch (discarding the result)
+		// is a silent no-op. Assert the registered handler returns the patch.
+		const requestHandlers = on.mock.calls
+			.map(([event, handler]) => [event, handler] as const)
+			.filter(([event]) => event === "before_provider_request");
+		expect(requestHandlers).toHaveLength(1);
+		const [, handler] = requestHandlers[0]!;
+
+		const patched = await handler(
+			{ payload: { model: "MiniMax-M3", thinking: { type: "enabled" } } },
+			{ model: { provider: "tokenrouter", id: "MiniMax-M3" } },
+		);
+		expect(patched).toEqual({
+			model: "MiniMax-M3",
+			thinking: { type: "adaptive" },
+			reasoning_split: true,
+		});
+
+		const untouched = await handler(
+			{
+				payload: { model: "claude-3-5-sonnet", thinking: { type: "enabled" } },
+			},
+			{ model: { provider: "anthropic", id: "claude-3-5-sonnet" } },
+		);
+		expect(untouched).toBeUndefined();
+	});
+});
+
+describe("TokenRouter request normalization and streaming", () => {
+	it("normalizes payloads through the exported seam", () => {
+		// Wire quirks are encoded in one boundary function: reasoning_split is
+		// always requested, MiniMax thinking is adaptive, invalid efforts drop.
+		expect(
+			normalizeTokenRouterRequestPayload({
+				model: "deepseek-r1",
+				reasoning_effort: "none",
+			}),
+		).toEqual({ model: "deepseek-r1", reasoning_split: true });
+
+		// String payloads round-trip only when something changed.
+		const raw = JSON.stringify({ model: "gpt-5", reasoning_split: true });
+		expect(normalizeTokenRouterRequestPayload(raw)).toBe(raw);
+	});
+
+	it("streams through the standard lazy OpenAI-completions bridge", async () => {
+		const stream = vi.fn(() => {
+			const inner = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				inner.push({ type: "text_start", text: "" } as never);
+				inner.push({ type: "done", message: {} as never } as never);
+			});
+			return inner;
+		});
+		const streamSimple = vi.fn(() => {
+			const inner = createAssistantMessageEventStream();
+			queueMicrotask(() => {
+				inner.push({ type: "text_delta", text: "standard" } as never);
+				inner.push({ type: "done", message: {} as never } as never);
+			});
+			return inner;
+		});
+		__setCompatLoaderForTests(async () =>
+			Promise.resolve({
+				openAICompletionsApi: () => ({ stream, streamSimple }),
+				anthropicMessagesApi: vi.fn(),
+			} as never),
+		);
+		try {
+			const { provider } = createTokenRouterProvider();
+			const testModel = {
+				id: "deepseek-r1",
+				api: "openai-completions",
+				provider: "tokenrouter",
+				baseUrl: "https://api.tokenrouter.com/v1",
+			} as never;
+
+			const simpleEvents: Array<{ type?: string }> = [];
+			for await (const event of provider.streamSimple(testModel, {} as never)) {
+				simpleEvents.push(event as { type?: string });
+			}
+			const streamEvents: Array<{ type?: string }> = [];
+			for await (const event of provider.stream(testModel, {} as never)) {
+				streamEvents.push(event as { type?: string });
+			}
+
+			// Both provider stream entries delegate to pi-ai's openAICompletionsApi
+			// through the lazy bridge — no custom wire implementation.
+			expect(streamSimple).toHaveBeenCalledTimes(1);
+			expect(stream).toHaveBeenCalledTimes(1);
+			expect(simpleEvents.some((event) => event.type === "text_delta")).toBe(
+				true,
+			);
+			expect(streamEvents.some((event) => event.type === "text_start")).toBe(
+				true,
+			);
+		} finally {
+			__setCompatLoaderForTests(undefined);
+		}
 	});
 });

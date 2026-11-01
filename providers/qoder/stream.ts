@@ -14,20 +14,24 @@ import type {
 	Api,
 	AssistantMessage,
 	AssistantMessageEventStream as PiAssistantMessageEventStream,
-	Context,
 	Model,
 	SimpleStreamOptions,
 	StopReason,
 	TextContent,
 	ThinkingContent,
 	ToolCall,
+	TranscriptContext,
 } from "@earendil-works/pi-ai/compat";
 import {
-	AssistantMessageEventStream as LocalAssistantMessageEventStream,
-} from "../../lib/assistant-message-event-stream.ts";
+	getCurrentSystemPrompt,
+	getCurrentTools,
+} from "../../lib/transcript-helpers.ts";
+import { AssistantMessageEventStream as LocalAssistantMessageEventStream } from "../../lib/assistant-message-event-stream.ts";
 import { BASE_URL_QODER } from "../../constants.ts";
 import { createLogger } from "../../lib/logger.ts";
+import { withSignal } from "../../lib/util.ts";
 import { getCachedModelConfig, staticModels } from "./models.ts";
+import { isChatModelConfig } from "../../lib/types.ts";
 import { ThinkingTagParser } from "./thinking-parser.ts";
 import { transformMessagesForQoder, transformTools } from "./transform.ts";
 
@@ -287,8 +291,8 @@ async function consumeSSEStream(
 			const line = buffer.substring(0, lineEnd).trim();
 			buffer = buffer.substring(lineEnd + 1);
 
-			const done = handleSSELine(state, line);
-			if (done) break;
+			const lineDone = handleSSELine(state, line);
+			if (lineDone) break;
 		}
 	}
 }
@@ -323,7 +327,7 @@ interface StreamSetup {
 
 function buildStreamSetup(
 	model: Model<Api>,
-	context: Context,
+	context: TranscriptContext,
 	options: SimpleStreamOptions | undefined,
 ): StreamSetup {
 	const accessToken = options?.apiKey;
@@ -346,8 +350,13 @@ function buildStreamSetup(
 
 	const maxOutputTokens = (modelConfig.max_output_tokens as number) || 32768;
 
+	// Pi 0.86+ normalizes the request into a TranscriptContext: the system
+	// prompt and tool declarations live in the transcript's system messages and
+	// are read via the transcript helpers (top-level context.systemPrompt /
+	// context.tools were removed). getCurrentSystemPrompt folds any
+	// mid-conversation system messages into one prompt.
+	const systemText = getCurrentSystemPrompt(context.messages) || "";
 	let normalizedMessages = transformMessagesForQoder(context.messages);
-	const systemText = context.systemPrompt || "";
 
 	// Prepend system prompt as a system message if present.
 	if (systemText) {
@@ -359,10 +368,8 @@ function buildStreamSetup(
 
 	const maxTokens = resolveMaxTokens(maxOutputTokens, options?.maxTokens);
 
-	const toolsRaw =
-		context.tools && context.tools.length > 0
-			? transformTools(context.tools)
-			: undefined;
+	const tools = getCurrentTools(context.messages);
+	const toolsRaw = tools.length > 0 ? transformTools(tools) : undefined;
 
 	if (isDebug) {
 		logger.info("[QODER] streaming request", {
@@ -412,12 +419,21 @@ async function fetchQoderStream(
 		"User-Agent": "pi-free-providers",
 	};
 
-	const response = await fetch(QODER_CHAT_URL, {
-		method: "POST",
-		headers,
-		body: Buffer.from(JSON.stringify(reqBody)),
-		signal,
-	});
+	// QODER_CHAT_URL is a build-time constant derived from BASE_URL_QODER; no
+	// request input reaches the destination host, so the SSRF heuristic is a
+	// false positive here.
+	// pi-lens-ignore: ts-ssrf
+	const response = await fetch(
+		QODER_CHAT_URL,
+		withSignal(
+			{
+				method: "POST",
+				headers,
+				body: Buffer.from(JSON.stringify(reqBody)),
+			},
+			signal,
+		),
+	);
 
 	if (!response.ok) {
 		const errText = await response.text();
@@ -447,7 +463,7 @@ async function fetchQoderStream(
 
 export function streamQoder(
 	model: Model<Api>,
-	context: Context,
+	context: TranscriptContext,
 	options?: SimpleStreamOptions,
 ): PiAssistantMessageEventStream {
 	const stream = new LocalAssistantMessageEventStream();
@@ -476,9 +492,15 @@ export function streamQoder(
 		timestamp: Date.now(),
 	};
 
-	// Run async — AssistantMessageEventStream is a push-based pull stream
-	runStream(output, stream, model, context, options);
+	// Detached by design: return the push-based shell synchronously while
+	// runStream owns completion/error events for the asynchronous producer.
+	void runStream(output, stream, model, context, options);
 
+	// SAFETY: stream is the local push-based shell (compat's
+	// AssistantMessageEventStream); runStream drives it through the same
+	// start/text/thinking/toolcall/done/error event protocol that pi-ai's
+	// Provider.stream contract iterates, so the cast only relabels the local
+	// declaration to the interface Pi's runtime consumes.
 	return stream as unknown as PiAssistantMessageEventStream;
 }
 
@@ -486,7 +508,7 @@ async function runStream(
 	output: AssistantMessage,
 	stream: LocalAssistantMessageEventStream,
 	model: Model<Api>,
-	context: Context,
+	context: TranscriptContext,
 	options: SimpleStreamOptions | undefined,
 ): Promise<void> {
 	try {
@@ -535,8 +557,11 @@ async function runStream(
 		});
 		stream.end();
 	} catch (e: unknown) {
-		const logger = (await import("../../lib/logger.ts")).createLogger("qoder");
-		logger.error("stream error", {
+		// Local binding (not the module logger): the static import would cycle.
+		const streamLogger = (await import("../../lib/logger.ts")).createLogger(
+			"qoder",
+		);
+		streamLogger.error("stream error", {
 			error: e instanceof Error ? e.message : String(e),
 		});
 		output.stopReason = options?.signal?.aborted ? "aborted" : "error";
@@ -559,7 +584,9 @@ async function runStream(
 // =============================================================================
 
 const REASONING_MODEL_IDS = new Set(
-	staticModels.filter((m) => m.reasoning).map((m) => m.id),
+	staticModels
+		.filter((m) => isChatModelConfig(m) && m.reasoning)
+		.map((m) => m.id),
 );
 
 function isReasoningModel(modelId: string): boolean {

@@ -53,9 +53,10 @@ describe("models.dev metadata enrichment", () => {
 			},
 		});
 
-		const [model] = await enrichModelsWithModelsDev([baseModel], {
+		const enriched0 = await enrichModelsWithModelsDev([baseModel], {
 			providerId: "deepinfra",
 		});
+		const model = enriched0[0]!;
 
 		expect(model.contextWindow).toBe(262_144);
 		expect(model.maxTokens).toBe(32_768);
@@ -109,9 +110,10 @@ describe("models.dev metadata enrichment", () => {
 			compat: { supportsDeveloperRole: true },
 		};
 
-		const [model] = await enrichModelsWithModelsDev([explicit], {
+		const enriched1 = await enrichModelsWithModelsDev([explicit], {
 			providerId: "openrouter",
 		});
+		const model = enriched1[0]!;
 
 		expect(model.contextWindow).toBe(131_072);
 		expect(model.maxTokens).toBe(8_192);
@@ -141,10 +143,11 @@ describe("models.dev metadata enrichment", () => {
 			},
 		});
 
-		const [model] = await enrichModelsWithModelsDev([baseModel], {
+		const enriched2 = await enrichModelsWithModelsDev([baseModel], {
 			providerId: "openrouter",
 			enrichCost: "fallback-only",
 		});
+		const model = enriched2[0]!;
 
 		expect(model.cost).toEqual({
 			input: 0.000002,
@@ -172,10 +175,11 @@ describe("models.dev metadata enrichment", () => {
 		expect(
 			(await fetchModelsDevMeta("together"))["Qwen/Qwen3.6-Plus"],
 		).toBeDefined();
-		const [model] = await enrichModelsWithModelsDev(
+		const enriched3 = await enrichModelsWithModelsDev(
 			[{ ...baseModel, id: "Qwen/Qwen3.6-Plus" }],
 			{ providerId: "gateway-not-in-catalog" },
 		);
+		const model = enriched3[0]!;
 		expect(model.contextWindow).toBe(131_072);
 	});
 
@@ -214,8 +218,8 @@ describe("models.dev metadata enrichment", () => {
 		expect(globalThis.fetch).toHaveBeenCalledTimes(1);
 	});
 
-	it("preserves native OpenCode protocol metadata during discovery", () => {
-		const [model] = applyNativeProtocolMetadata(
+	it("preserves native OpenCode protocol metadata during discovery", async () => {
+		const enriched4 = await applyNativeProtocolMetadata(
 			[
 				{
 					...baseModel,
@@ -225,16 +229,25 @@ describe("models.dev metadata enrichment", () => {
 			],
 			"opencode",
 		);
+		const model = enriched4[0]!;
 
 		expect(model.api).toBe("openai-responses");
-		expect(model.baseUrl).toBe("https://opencode.ai/zen/v1");
+		// #647: Pi 1.3 moved Zen to /inference; preserve the installed host's
+		// authoritative endpoint rather than pinning Pi 1.1's /zen URL.
+		const { getBuiltinModels } =
+			await import("@earendil-works/pi-ai/providers/all");
+		const native = getBuiltinModels("opencode").find(
+			(entry) => entry.id === model.id,
+		);
+		expect(native?.baseUrl).toBeTruthy();
+		expect(model.baseUrl).toBe(native!.baseUrl);
 		expect(model.compat).toMatchObject({
 			sessionAffinityFormat: "openai-nosession",
 		});
 	});
 
-	it("preserves known OpenCode free metadata when discovery omits pricing", () => {
-		const models = applyNativeFreeMetadata(
+	it("preserves known OpenCode free metadata when discovery omits pricing", async () => {
+		const models = await applyNativeFreeMetadata(
 			[
 				{
 					...baseModel,

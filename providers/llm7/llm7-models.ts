@@ -19,6 +19,7 @@ import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import { applyHidden } from "../../config.ts";
 import { BASE_URL_LLM7, PROVIDER_LLM7 } from "../../constants.ts";
 import { isFreeModel } from "../../lib/registry.ts";
+import { withGatewayCompat } from "../../lib/native-provider.ts";
 
 // =============================================================================
 // Model Definitions
@@ -103,15 +104,13 @@ export function fetchLlm7Catalog(): {
  * Adds the provider id, wire api, and gateway baseUrl that the legacy
  * registerProvider config form used to supply implicitly.
  */
-export function toLlm7Model(
-	m: ProviderModelConfig,
-): Model<"openai-completions"> {
-	return {
+function toLlm7Model(m: ProviderModelConfig): Model<"openai-completions"> {
+	return withGatewayCompat({
 		...m,
 		api: "openai-completions",
 		provider: PROVIDER_LLM7,
 		baseUrl: m.baseUrl ?? BASE_URL_LLM7,
-	} as Model<"openai-completions">;
+	} as Model<"openai-completions">);
 }
 
 /** Convert a batch of model configs to native Model objects. */

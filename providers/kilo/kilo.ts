@@ -17,7 +17,7 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { getKiloApiKey, getKiloShowPaid, PROVIDER_KILO } from "../../config.ts";
+import { getKiloApiKey, PROVIDER_KILO } from "../../config.ts";
 import { URL_KILO_TOS } from "../../constants.ts";
 import { registerWithGlobalToggle } from "../../lib/registry.ts";
 import {
@@ -44,6 +44,7 @@ const XML_LEAK_NEEDLES: readonly string[] = [
 	"<tool>",
 	"<tool_call>",
 	"<function_call>",
+	// eslint-disable-next-line no-useless-concat -- intentional: keeps the `<invoke` needle out of the source literally (detectors match code, not prose).
 	"<" + "invoke",
 	"<" + String.fromCharCode(97) + "ntml:tool_use>",
 ];
@@ -161,7 +162,6 @@ export default async function kiloProvider(pi: ExtensionAPI) {
 	registerNativeProviderToggle(pi, {
 		providerId: PROVIDER_KILO,
 		stored,
-		getShowPaid: getKiloShowPaid,
 		reRegister,
 	});
 

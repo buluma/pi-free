@@ -3,10 +3,20 @@
  *
  * Provides a small mark/measure API (monotonic `performance.now()` based) to
  * time the phases of `piFreeEntry` and, importantly, per-provider setup
- * duration. Produces a structured startup summary (total entry time,
+ * duration. Produces a structured startup summary (total startup time,
  * per-provider timings sorted slowest-first, cache vs network counts, and
  * failures) that is logged once at the end of startup and surfaced via the
  * `/free-startup` command.
+ *
+ * Timing origin: the clock starts when THIS MODULE is first evaluated
+ * (`MODULE_LOAD_ORIGIN`, captured at module scope). `index.ts` imports
+ * `./lib/startup-timing.ts` before every provider module, and ES modules
+ * evaluate imports depth-first in declaration order, so the origin precedes
+ * the entire static module graph (all provider imports) as well as
+ * `piFreeEntry`. `totalMs` therefore covers module-graph execution plus the
+ * entry factory — the full cost pi-free adds to Pi's boot, not just the
+ * factory. On extension reload the module is not re-evaluated, so the origin
+ * remains the FIRST module load; see {@link beginStartup}.
  *
  * Design constraints:
  * - Zero/negligible overhead: everything is in-memory arithmetic on a
@@ -20,18 +30,25 @@ import { createLogger } from "./logger.ts";
 
 const _logger = createLogger("startup-timing");
 
+/**
+ * Monotonic timestamp of this module's first evaluation — the true start of
+ * pi-free's impact on Pi boot (see file header). Captured at module scope so
+ * it precedes the evaluation of every module imported after this one.
+ */
+const MODULE_LOAD_ORIGIN = performance.now();
+
 // =============================================================================
 // Types
 // =============================================================================
 
-export interface PhaseTiming {
+interface PhaseTiming {
 	/** Phase name (e.g. "providers", "global-handlers"). */
 	name: string;
 	/** Wall-clock duration in milliseconds. */
 	durationMs: number;
 }
 
-export interface ProviderTiming {
+interface ProviderTiming {
 	/** Provider name (derived from the setup function name). */
 	provider: string;
 	/** Wall-clock setup duration in milliseconds. */
@@ -42,19 +59,31 @@ export interface ProviderTiming {
 	error?: string;
 }
 
-export interface SessionStartTiming {
+interface SessionStartTiming {
 	label: string;
 	durationMs: number;
 	success: boolean;
 }
 
-export interface ProviderCacheNetworkTiming {
+interface ProviderCacheNetworkTiming {
 	provider: string;
 	cacheHits: number;
 	networkFetches: number;
 	networkSuccesses: number;
 	networkFailures: number;
 	networkMsTotal: number;
+	/** Native refreshes cancelled via context.signal (expected — counted, never logged as errors). */
+	aborts: number;
+	/** Native fetches that returned 0 models and retained the previous list. */
+	emptyRetains: number;
+	/** Native refreshes that completed and published models. */
+	refreshOks: number;
+	/** Times the catalog was restored from Pi's models store. */
+	restoredCount: number;
+	/** Age (ms) of the store entry at the last restore. */
+	storeAgeMs?: number;
+	/** Model count of the most recent successful native refresh. */
+	lastRefreshModelCount?: number;
 }
 
 export interface StartupSummary {
@@ -62,8 +91,25 @@ export interface StartupSummary {
 	runId: string;
 	/** ISO timestamp of when startup began. */
 	startedAt: string;
-	/** Total wall-clock time of the timed startup, in milliseconds. */
+	/**
+	 * Total wall-clock time in milliseconds, measured from first module load
+	 * (includes the static module graph, e.g. provider imports) through
+	 * startup finalization.
+	 */
 	totalMs: number;
+	/**
+	 * Milliseconds between first module load and `beginStartup()` — i.e. the
+	 * static module-graph evaluation time that the old timing used to miss.
+	 * On extension reload the module is not re-evaluated, so this also covers
+	 * the time since the original load.
+	 */
+	moduleGraphMs: number;
+	/**
+	 * True when this run is an extension reload: the module is not
+	 * re-evaluated, so totalMs/moduleGraphMs measure time since the FIRST
+	 * module load, which may be long before this run.
+	 */
+	reloaded: boolean;
 	/** Named phases in the order they completed. */
 	phases: PhaseTiming[];
 	/** Per-provider timings, sorted slowest-first. */
@@ -89,8 +135,20 @@ export interface StartupSummary {
 interface StartupState {
 	runId: string;
 	startedAt: string;
-	/** Monotonic start timestamp (performance.now()). */
+	/**
+	 * Monotonic start timestamp (performance.now()). Always
+	 * {@link MODULE_LOAD_ORIGIN}, so the total includes module-graph
+	 * evaluation.
+	 */
 	start: number;
+	/** Elapsed ms from module load to beginStartup(). */
+	moduleGraphMs: number;
+	/**
+	 * True when this run is an extension reload: the module is not
+	 * re-evaluated, so the origin (and thus totalMs/moduleGraphMs) measures
+	 * time since the FIRST module load, which may be long before this run.
+	 */
+	reloaded: boolean;
 	/** Total elapsed ms, filled in on finalize. */
 	totalMs: number;
 	finalized: boolean;
@@ -126,7 +184,9 @@ function freshState(): StartupState {
 	return {
 		runId: makeRunId(),
 		startedAt: new Date().toISOString(),
-		start: monotonicNow(),
+		start: MODULE_LOAD_ORIGIN,
+		moduleGraphMs: 0,
+		reloaded: false,
 		totalMs: 0,
 		finalized: false,
 		phases: [],
@@ -145,6 +205,8 @@ function freshState(): StartupState {
 // Module-level state. Always present so recording before beginStartup() is a
 // harmless no-op relative to module load rather than a crash.
 let _state: StartupState = freshState();
+/** Number of beginStartup() calls; >1 means extension reloads occurred. */
+let _startupRuns = 0;
 
 function round(ms: number): number {
 	return Math.max(0, Math.round(ms));
@@ -158,10 +220,20 @@ function round(ms: number): number {
  * Begin (or reset) a startup timing run. Call at the very top of
  * `piFreeEntry`. Safe to call multiple times (e.g. on extension reload) —
  * each call starts a fresh run.
+ *
+ * The run's clock origin is always {@link MODULE_LOAD_ORIGIN} — the first
+ * evaluation of this module — NOT the moment this function is called, so
+ * `totalMs` includes the static module graph (provider imports) that runs
+ * before `piFreeEntry`. On extension reload the module is not re-evaluated,
+ * so the origin stays the first module load and `moduleGraphMs`/`totalMs`
+ * additionally cover the time since then.
  */
 export function beginStartup(): void {
 	try {
+		_startupRuns += 1;
 		_state = freshState();
+		_state.reloaded = _startupRuns > 1;
+		_state.moduleGraphMs = round(monotonicNow() - MODULE_LOAD_ORIGIN);
 	} catch (err) {
 		_logger.warn("beginStartup failed", {
 			error: err instanceof Error ? err.message : String(err),
@@ -309,6 +381,10 @@ function cacheNetworkEntry(provider: string): ProviderCacheNetworkTiming {
 			networkSuccesses: 0,
 			networkFailures: 0,
 			networkMsTotal: 0,
+			aborts: 0,
+			emptyRetains: 0,
+			refreshOks: 0,
+			restoredCount: 0,
 		};
 		_state.cacheNetwork.set(provider, entry);
 	}
@@ -347,6 +423,99 @@ export function recordNetworkFetch(
 	} catch {
 		// best-effort
 	}
+}
+
+// =============================================================================
+// Public API — native refresh outcomes (M1, #437)
+// =============================================================================
+
+/** Record that a native refresh was cancelled by an aborted signal. */
+export function recordNativeAbort(provider: string): void {
+	try {
+		cacheNetworkEntry(provider).aborts += 1;
+	} catch {
+		// best-effort
+	}
+}
+
+/** Record that a native fetch returned 0 models and the previous list was retained. */
+export function recordNativeEmptyRetain(provider: string): void {
+	try {
+		cacheNetworkEntry(provider).emptyRetains += 1;
+	} catch {
+		// best-effort
+	}
+}
+
+/** Record a successful native refresh that published `modelCount` models. */
+export function recordNativeRefreshOk(
+	provider: string,
+	modelCount: number,
+): void {
+	try {
+		const entry = cacheNetworkEntry(provider);
+		entry.refreshOks += 1;
+		entry.lastRefreshModelCount = modelCount;
+	} catch {
+		// best-effort
+	}
+}
+
+/** Record a catalog restore from Pi's models store, with the store entry age. */
+export function recordNativeRestored(
+	provider: string,
+	storeAgeMs?: number,
+): void {
+	try {
+		const entry = cacheNetworkEntry(provider);
+		entry.restoredCount += 1;
+		if (
+			typeof storeAgeMs === "number" &&
+			Number.isFinite(storeAgeMs) &&
+			storeAgeMs > 0 // checkedAt=0 (corrupt entry) must not read as ~20k days
+		) {
+			entry.storeAgeMs = Math.round(storeAgeMs);
+		}
+	} catch {
+		// best-effort
+	}
+}
+
+/** Age threshold (ms) above which a restored store entry is flagged stale (M1 surface). */
+const STALE_STORE_FLAG_MS = 7 * 24 * 60 * 60 * 1000; // 7d — matches native-provider's warn threshold
+
+function formatStoreAge(ageMs: number): string {
+	const hours = Math.round(ageMs / (60 * 60 * 1000));
+	if (hours >= 48) return `${Math.round(hours / 24)}d old`;
+	return `${hours}h old`;
+}
+
+/**
+ * Concise per-provider native-outcome flags (aborts, empty retains, stale
+ * stores) for surfacing in `/free-startup` and `/pi-free-health`. Credential
+ * free by construction — counters and ages only. (M1, #437)
+ */
+export function nativeRefreshFlags(s: StartupSummary): string[] {
+	const flags: string[] = [];
+	for (const entry of s.cacheNetwork) {
+		const parts: string[] = [];
+		if (entry.aborts > 0) {
+			parts.push(`${entry.aborts} abort${entry.aborts > 1 ? "s" : ""}`);
+		}
+		if (entry.emptyRetains > 0) {
+			parts.push(
+				`${entry.emptyRetains} empty-retain${entry.emptyRetains > 1 ? "s" : ""}`,
+			);
+		}
+		if (
+			typeof entry.storeAgeMs === "number" &&
+			entry.storeAgeMs >= STALE_STORE_FLAG_MS
+		) {
+			parts.push(`store ${formatStoreAge(entry.storeAgeMs)}`);
+		}
+		if (parts.length > 0) flags.push(`${entry.provider}: ${parts.join(", ")}`);
+	}
+	return flags;
 }
 
 export function recordSessionStartHandler(
@@ -404,6 +573,8 @@ export function getStartupSummary(): StartupSummary {
 		runId: _state.runId,
 		startedAt: _state.startedAt,
 		totalMs,
+		moduleGraphMs: _state.moduleGraphMs,
+		reloaded: _state.reloaded,
 		phases: [..._state.phases],
 		providers,
 		cacheHits: _state.cacheHits,
@@ -471,6 +642,10 @@ export function formatStartupSummary(maxProviders = 15): string {
 	const s = getStartupSummary();
 	const lines: string[] = [
 		`⏱  Pi-Free Startup: ${s.totalMs}ms (run ${s.runId})`,
+		`   Measured from first module load — includes module graph (${s.moduleGraphMs}ms) + entry factory` +
+			(s.reloaded
+				? " (RELOADED: origin is the first module load, so this total includes time since then)"
+				: ""),
 		"",
 		...renderPhaseLines(s.phases),
 		...renderProviderLines(s.providers, maxProviders),
@@ -484,7 +659,22 @@ export function formatStartupSummary(maxProviders = 15): string {
 			lines.push(
 				`  ${entry.provider}: cache ${entry.cacheHits}, network ${entry.networkFetches} (${entry.networkSuccesses} ok, ${entry.networkFailures} failed, ${entry.networkMsTotal}ms)`,
 			);
+			if (entry.restoredCount > 0 || entry.refreshOks > 0) {
+				lines.push(
+					`    native: restored ${entry.restoredCount}, refresh ok ${entry.refreshOks} (${entry.lastRefreshModelCount ?? 0} models)` +
+						(typeof entry.storeAgeMs === "number"
+							? `, store ${formatStoreAge(entry.storeAgeMs)}`
+							: ""),
+				);
+			}
 		}
+		lines.push("");
+	}
+
+	const outcomeFlags = nativeRefreshFlags(s);
+	if (outcomeFlags.length > 0) {
+		lines.push("Native refresh flags:");
+		for (const flag of outcomeFlags) lines.push(`  ${flag}`);
 		lines.push("");
 	}
 
@@ -518,10 +708,12 @@ export function logStartupSummary(): void {
 	try {
 		const s = getStartupSummary();
 		_logger.info(
-			`[pi-free] startup complete in ${s.totalMs}ms`,
+			`[pi-free] startup complete in ${s.totalMs}ms (from first module load; module graph ${s.moduleGraphMs}ms)`,
 			{
 				runId: s.runId,
 				totalMs: s.totalMs,
+				moduleGraphMs: s.moduleGraphMs,
+				origin: "first-module-load",
 				providers: s.providers.length,
 				cacheHits: s.cacheHits,
 				networkFetches: s.networkFetches,

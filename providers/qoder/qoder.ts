@@ -7,7 +7,6 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { getProviderShowPaid } from "../../config.ts";
 import { PROVIDER_QODER } from "../../constants.ts";
 import { registerWithGlobalToggle } from "../../lib/registry.ts";
 import {
@@ -33,18 +32,11 @@ export default async function qoderProvider(pi: ExtensionAPI): Promise<void> {
 	registerNativeProviderToggle(pi, {
 		providerId: PROVIDER_QODER,
 		stored,
-		getShowPaid: () => getProviderShowPaid(PROVIDER_QODER),
 		reRegister,
 	});
 	registerNativeProviderRefresh(pi, PROVIDER_QODER);
 }
 
-export { createQoderProvider } from "./qoder-provider.ts";
-export {
-	loginQoder,
-	loginQoderNative,
-	refreshQoderCredential,
-	refreshQoderToken,
-	qoderAuth,
-} from "./auth.ts";
-export { streamQoder } from "./stream.ts";
+// Re-export the auth object for tests (tests/qoder-auth.test.ts imports it
+// from this module, the provider's public entry point).
+export { qoderAuth } from "./auth.ts";

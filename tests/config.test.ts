@@ -32,10 +32,25 @@ vi.mock("node:fs", () => {
 			mockData.set(dest, mockData.get(src) ?? "");
 		}),
 		existsSync: vi.fn((path: string) => mockData.has(path)),
+		fsyncSync: vi.fn(),
+		closeSync: vi.fn(),
 		mkdirSync: vi.fn(),
+		openSync: vi.fn(() => 999),
 		readFileSync: vi.fn((path: string) => mockData.get(path) ?? ""),
 		writeFileSync: vi.fn((path: string, content: string) => {
 			mockData.set(path, content);
+		}),
+		renameSync: vi.fn((src: string, dest: string) => {
+			// Atomic-write seam: the tmp write lands in the map, the rename
+			// publishes it — mirrors the real tmp+rename contract.
+			mockData.set(dest, mockData.get(src) ?? "");
+			mockData.delete(src);
+		}),
+		rmSync: vi.fn((path: string) => {
+			mockData.delete(path);
+			for (const key of mockData.keys()) {
+				if (key === path || key.startsWith(`${path}/`)) mockData.delete(key);
+			}
 		}),
 		__mockData: mockData,
 	};
@@ -63,6 +78,7 @@ function parseMockJson(value: unknown): Record<string, unknown> {
 	} catch (error) {
 		throw new Error(
 			`Invalid mock JSON: ${error instanceof Error ? error.message : String(error)}`,
+			{ cause: error },
 		);
 	}
 }
@@ -217,6 +233,38 @@ describe("show-paid getters", () => {
 		expect(getOpenrouterShowPaid()).toBe(false);
 	});
 
+	it("getOpencodeFreeShowPaid reads its own key, not the shared opencode key", async () => {
+		vi.stubEnv("HOME", "/tmp");
+		const fs = await import("node:fs");
+		const { __mockData } = fs as any;
+		__mockData.set(
+			configPath(),
+			JSON.stringify({
+				opencode_show_paid: true,
+				opencode_free_show_paid: false,
+			}),
+		);
+
+		const { getOpencodeFreeShowPaid } = await import("../config.ts");
+		expect(getOpencodeFreeShowPaid()).toBe(false);
+	});
+
+	it("getOpencodeGoShowPaid reads its own key, not the shared opencode key", async () => {
+		vi.stubEnv("HOME", "/tmp");
+		const fs = await import("node:fs");
+		const { __mockData } = fs as any;
+		__mockData.set(
+			configPath(),
+			JSON.stringify({
+				opencode_show_paid: false,
+				opencode_go_show_paid: true,
+			}),
+		);
+
+		const { getOpencodeGoShowPaid } = await import("../config.ts");
+		expect(getOpencodeGoShowPaid()).toBe(true);
+	});
+
 	it("getProviderShowPaid maps provider ids to persisted flags", async () => {
 		vi.stubEnv("HOME", "/tmp");
 		const fs = await import("node:fs");
@@ -234,9 +282,8 @@ describe("show-paid getters", () => {
 		const { __mockData } = fs as any;
 		__mockData.set(configPath(), JSON.stringify({ routeway_show_paid: true }));
 
-		const { getProviderShowPaid, getRoutewayShowPaid } = await import(
-			"../config.ts"
-		);
+		const { getProviderShowPaid, getRoutewayShowPaid } =
+			await import("../config.ts");
 		expect(getRoutewayShowPaid()).toBe(true);
 		expect(getProviderShowPaid("routeway")).toBe(true);
 	});
@@ -250,9 +297,8 @@ describe("show-paid getters", () => {
 			JSON.stringify({ opengateway_show_paid: true }),
 		);
 
-		const { getOpengatewayShowPaid, getProviderShowPaid } = await import(
-			"../config.ts"
-		);
+		const { getOpengatewayShowPaid, getProviderShowPaid } =
+			await import("../config.ts");
 		expect(getOpengatewayShowPaid()).toBe(true);
 		expect(getProviderShowPaid("opengateway")).toBe(true);
 	});
@@ -459,13 +505,13 @@ describe("config re-exports", () => {
 			"getKiloShowPaid",
 			"getClineShowPaid",
 			"getZenmuxShowPaid",
-			"getCrofaiShowPaid",
 			"getOllamaShowPaid",
 			"getOpenrouterShowPaid",
 			"getOpencodeShowPaid",
+			"getOpencodeFreeShowPaid",
+			"getOpencodeGoShowPaid",
 			"getProviderShowPaid",
 			"getZenmuxApiKey",
-			"getCrofaiApiKey",
 			"getOllamaApiKey",
 			"saveConfig",
 			"updateConfig",
@@ -474,5 +520,172 @@ describe("config re-exports", () => {
 		for (const name of getters) {
 			expect(typeof (cfg as any)[name]).toBe("function");
 		}
+	});
+});
+
+// =============================================================================
+// Per-provider view overrides (explicit choice vs follow-global)
+// =============================================================================
+
+describe("model view overrides", () => {
+	it("getModelViewOverride is undefined with no explicit choice", async () => {
+		vi.stubEnv("HOME", "/tmp");
+		const fs = await import("node:fs");
+		const { __mockData } = fs as any;
+		__mockData.set(configPath(), JSON.stringify({ free_only: true }));
+
+		const { getModelViewOverride } = await import("../config.ts");
+		expect(getModelViewOverride("kilo")).toBeUndefined();
+		expect(getModelViewOverride("no-such-provider")).toBeUndefined();
+	});
+
+	it("getModelViewOverride returns the sparse-map choice", async () => {
+		vi.stubEnv("HOME", "/tmp");
+		const fs = await import("node:fs");
+		const { __mockData } = fs as any;
+		__mockData.set(
+			configPath(),
+			JSON.stringify({ model_view_overrides: { kilo: "all" } }),
+		);
+
+		const { getModelViewOverride } = await import("../config.ts");
+		expect(getModelViewOverride("kilo")).toBe("all");
+		expect(getModelViewOverride("cline")).toBeUndefined();
+	});
+
+	it("getModelViewOverride honors a legacy explicit true", async () => {
+		vi.stubEnv("HOME", "/tmp");
+		const fs = await import("node:fs");
+		const { __mockData } = fs as any;
+		// Template-materialized `false` keys must NOT count (they cannot be
+		// told apart from "never touched"); only legacy `true` upgrades.
+		__mockData.set(
+			configPath(),
+			JSON.stringify({ kilo_show_paid: true, cline_show_paid: false }),
+		);
+
+		const { getModelViewOverride } = await import("../config.ts");
+		expect(getModelViewOverride("kilo")).toBe("all");
+		expect(getModelViewOverride("cline")).toBeUndefined();
+	});
+
+	it("getModelViewOverride counts a set env var as explicit", async () => {
+		vi.stubEnv("KILO_SHOW_PAID", "false");
+		vi.stubEnv("HOME", "/tmp");
+		const fs = await import("node:fs");
+		const { __mockData } = fs as any;
+		__mockData.set(configPath(), JSON.stringify({ free_only: true }));
+
+		const { getModelViewOverride } = await import("../config.ts");
+		expect(getModelViewOverride("kilo")).toBe("free");
+	});
+
+	it("setModelViewOverride merges the map and drops the legacy key", async () => {
+		vi.stubEnv("HOME", "/tmp");
+		const fs = await import("node:fs");
+		const { __mockData, writeFileSync } = fs as any;
+		__mockData.set(
+			configPath(),
+			JSON.stringify({
+				free_only: true,
+				kilo_show_paid: true,
+				model_view_overrides: { cline: "free" },
+			}),
+		);
+
+		const { setModelViewOverride } = await import("../config.ts");
+		await setModelViewOverride("kilo", "all");
+
+		const lastCall =
+			writeFileSync.mock.calls[writeFileSync.mock.calls.length - 1];
+		const written = parseMockJson(lastCall[1]);
+		expect(written.free_only).toBe(true);
+		expect(written.model_view_overrides).toEqual({
+			cline: "free",
+			kilo: "all",
+		});
+		expect("kilo_show_paid" in written).toBe(false);
+	});
+
+	// #603: read -> compute -> await write let two rapid toggles read the
+	// same pre-write state and collapse to one net flip. The fix resolves
+	// the flip INSIDE the locked read-modify-write.
+	describe("atomic toggle (#603)", () => {
+		it("two rapid toggles flip twice instead of collapsing", async () => {
+			vi.stubEnv("HOME", "/tmp");
+			const fs = await import("node:fs");
+			const { __mockData, writeFileSync } = fs as any;
+			__mockData.set(configPath(), JSON.stringify({ free_only: true }));
+
+			const { toggleModelViewOverride } = await import("../config.ts");
+			const applied = await Promise.all([
+				toggleModelViewOverride("kilo"),
+				toggleModelViewOverride("kilo"),
+			]);
+			// Two toggles must produce two DIFFERENT flips: all then free.
+			expect([...applied].sort()).toEqual(["all", "free"]);
+			const lastCall =
+				writeFileSync.mock.calls[writeFileSync.mock.calls.length - 1];
+			const written = parseMockJson(lastCall[1]);
+			expect(written.model_view_overrides).toEqual({ kilo: "free" });
+		});
+
+		it("pins the pre-fix collapse shape (read-then-write)", async () => {
+			// The shipped pre-fix call pattern, using the same primitives: both
+			// handlers resolve the flip before either awaits its write, so the
+			// second flip is computed from stale state.
+			vi.stubEnv("HOME", "/tmp");
+			const fs = await import("node:fs");
+			const { __mockData, writeFileSync } = fs as any;
+			__mockData.set(configPath(), JSON.stringify({ free_only: true }));
+
+			const { getModelViewOverride, getFreeOnly, setModelViewOverride } =
+				await import("../config.ts");
+			const readFlip = () =>
+				(getModelViewOverride("kilo") ?? (getFreeOnly() ? "free" : "all")) ===
+				"free"
+					? "all"
+					: "free";
+			const first = readFlip();
+			const second = readFlip();
+			await Promise.all([
+				setModelViewOverride("kilo", first),
+				setModelViewOverride("kilo", second),
+			]);
+			// Both read the same stale state: one net flip for two toggles.
+			expect(first).toBe(second);
+			const lastCall =
+				writeFileSync.mock.calls[writeFileSync.mock.calls.length - 1];
+			const written = parseMockJson(lastCall[1]);
+			expect(written.model_view_overrides).toEqual({ kilo: "all" });
+		});
+	});
+
+	it("clearModelViewOverrides removes the map and every legacy key", async () => {
+		vi.stubEnv("HOME", "/tmp");
+		const fs = await import("node:fs");
+		const { __mockData, writeFileSync } = fs as any;
+		__mockData.set(
+			configPath(),
+			JSON.stringify({
+				free_only: true,
+				kilo_show_paid: true,
+				opencode_free_show_paid: false,
+				model_view_overrides: { cline: "all" },
+				nvidia_api_key: "keep-me",
+			}),
+		);
+
+		const { clearModelViewOverrides } = await import("../config.ts");
+		await clearModelViewOverrides();
+
+		const lastCall =
+			writeFileSync.mock.calls[writeFileSync.mock.calls.length - 1];
+		const written = parseMockJson(lastCall[1]);
+		expect(written.free_only).toBe(true);
+		expect(written.nvidia_api_key).toBe("keep-me");
+		expect("model_view_overrides" in written).toBe(false);
+		expect("kilo_show_paid" in written).toBe(false);
+		expect("opencode_free_show_paid" in written).toBe(false);
 	});
 });

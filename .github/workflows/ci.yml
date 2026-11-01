@@ -16,8 +16,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # zizmor: artipacked - CI never pushes; no credential needed
+        with:
+          persist-credentials: false
+          # Full history so the whitespace check can diff against the base.
+          fetch-depth: 0
 
-      # v7.0.0
+      # v7.1.0
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: "22"
@@ -27,6 +32,32 @@ jobs:
 
       - name: Lockfile in sync with package.json
         run: npm run check:lockfile
+
+      # Canonical formatting (oxfmt): the single style authority. Without
+      # this gate, editor/agent formatters drift files apart (132 files
+      # drifted before the canonical reformat). Markdown is excluded in
+      # .oxfmtrc.json — oxfmt's embedded-code formatting is not idempotent.
+      - name: Check canonical formatting
+        run: npm run format:check
+
+      # Correctness + suspicious lints only (see .oxlintrc.json). Style
+      # belongs to the formatter; three rules encode repo conventions or
+      # toolchain limits and are allowed with reasons in the config.
+      - name: Lint with oxlint
+        run: npm run lint:oxlint
+
+      # Dead exports / deps gate (see knip.json). Entry points declared so
+      # extension entry, scripts, and tests are not flagged; re-export
+      # barrels are checked for genuinely dead entries.
+      - name: Check for dead code with knip
+        run: npm run check:knip
+
+      # Whitespace errors introduced by the change (trailing space,
+      # space-before-tab). The formatter subsumes most of this; the check
+      # stays as a cheap backstop for non-code files it does not own.
+      # Empty on push-to-master (HEAD is the tip); the branch diff on PRs.
+      - name: Check for whitespace errors
+        run: git diff --check origin/master...HEAD
 
       # Fail on known-vulnerable production deps — the code that actually ships
       # to users. DevDeps are excluded because they do not run in Pi installs.
@@ -51,8 +82,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # zizmor: artipacked - CI never pushes; no credential needed
+        with:
+          persist-credentials: false
 
-      # v7.0.0
+      # v7.1.0
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: "22"
@@ -62,23 +96,123 @@ jobs:
       # compiler transiently rather than require a pre-existing node_modules.
       - name: Install source checkout with production dependencies
         # Required here: prepare is the behavior under test. # NOSONAR
+        # zizmor: ignore[adhoc-packages] - ad-hoc install IS the test (#447)
         run: npm ci --omit=dev --no-audit --no-fund # NOSONAR
+
+      # #447: @earendil-works/pi-coding-agent and @earendil-works/pi-tui are
+      # optional peers now, so this install must NOT have vendored them (while
+      # @earendil-works/pi-ai, a real value import, must still be present).
+      - name: Verify no optional host-provided peer was vendored (#447)
+        run: node scripts/check-prod-install-shape.mjs
 
       - name: Verify production source build
         run: |
           test -f dist/index.js
           node scripts/check-runtime-imports.mjs
           node scripts/smoke-compiled.mjs ./dist/index.js
-          node scripts/smoke-pi-loader.mjs ./dist/index.js
 
-  test:
-    name: Unit tests
+      # smoke-pi-loader.mjs simulates loading dist/index.js through Pi's real
+      # extension loader, which lives inside @earendil-works/pi-coding-agent.
+      # #447 makes that package an optional peer, so this production install no
+      # longer vendors it (that is the fix) — install it here explicitly, as a
+      # standalone test fixture standing in for the host, so this step keeps
+      # verifying the real loader instead of depending on incidental vendoring.
+      # The fixture is the peer floor (>=0.86.0) as a literal, never an
+      # arbitrary old release: a 0.84.x pin tested a host pi-free does not
+      # support while no lane booted a supported one below the
+      # devDependency. A literal also satisfies S8543 (locked versions in
+      # install commands). The host-smoke floor lane installs the same
+      # literal — keep them in sync. The full floor/latest install paths
+      # live in host-smoke.yml; this step keeps the --omit=dev tree's
+      # loader check on the oldest supported host.
+      - name: Install pi-coding-agent fixture for the loader smoke test
+        # --ignore-scripts: this fixture only needs the package's files on
+        # disk for import.meta.resolve; it never runs pi-coding-agent's own
+        # lifecycle scripts, so skip them (SonarCloud S6505).
+        run: >-
+          npm install --no-save --ignore-scripts --no-audit --no-fund
+          @earendil-works/pi-coding-agent@0.86.0
+
+      - name: Smoke-load compiled entry through Pi's real loader
+        run: node scripts/smoke-pi-loader.mjs ./dist/index.js
+
+      # Same sick-tree detectors as install-test, run here against the
+      # --omit=dev tree so shape regressions surface one job earlier.
+      - name: Verify pi-ai transitive closure in production tree
+        run: node scripts/check-installed-closure.mjs .
+
+      - name: Execute pi-ai entries from production tree
+        run: node scripts/smoke-pi-ai-entries.mjs .
+
+      # #581: the entries smoke above runs against the healthy chain. A stale
+      # pi-ai copy shadowing the walk-up (right name/version, exports predating
+      # the allow-listed entries) made Node throw ERR_PACKAGE_PATH_NOT_EXPORTED,
+      # which the loader did not treat as "not found here" — every provider
+      # stream died at first use on otherwise-healthy installs. This builds the
+      # hostile layout and requires the loader to skip the shadowing copy.
+      - name: Recover pi-ai entries from a shadowed walk-up chain (#581)
+        run: node scripts/smoke-pi-ai-shadowed.mjs .
+
+      - name: Verify pi-ai deps hoist canonically in production tree
+        run: node scripts/check-hoisting.mjs .
+
+  managed-install-build:
+    name: Managed-install build (pi flags)
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # zizmor: artipacked - CI never pushes; no credential needed
+        with:
+          persist-credentials: false
 
-      # v7.0.0
+      # v7.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: "22"
+
+      # Replicates pi's managed git-extension install tree (pi's
+      # package-manager getNpmInstallArgs/getGitDependencyInstallArgs):
+      # --legacy-peer-deps suppresses peer resolution, so the pi-ai peer is
+      # absent and prepare must succeed via the warn-and-skip path in
+      # scripts/build.mjs (#593). `ci` (not pi's `install`) keeps versions
+      # locked and the lockfile untouched; the produced tree is the same
+      # shape. Deliberately build-only: the pi-ai-dependent smokes cannot
+      # run here by design — no pi-ai on disk is pi's intended shape; the
+      # host supplies it at runtime.
+      # S6505: lifecycle scripts MUST run here — prepare is the behavior
+      # under test. # NOSONAR
+      - name: Install with pi's managed-install flags
+        run: npm ci --omit=dev --legacy-peer-deps --no-audit --no-fund # NOSONAR
+
+      # npm leaves the empty @earendil-works scope dir behind even when
+      # every scoped package is omitted, so assert on pi-ai itself.
+      - name: Pin the precondition (pi-ai peer not installed)
+        run: test ! -e node_modules/@earendil-works/pi-ai
+
+      - name: Build must succeed without pi-ai
+        run: >
+          npm run build 2>&1 | tee build.log &&
+          grep -q "skipping dist/vendor" build.log
+
+      - name: Verify compiled entry exists
+        run: test -f dist/index.js
+
+  test:
+    name: Unit tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # zizmor: artipacked - CI never pushes; no credential needed
+        with:
+          persist-credentials: false
+
+      # v7.1.0
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: "22"
@@ -88,6 +222,48 @@ jobs:
 
       - name: Run tests
         run: npm run test:run
+
+      # Drives createAutoFallback() against a REAL pi-coding-agent
+      # ModelRuntime (auth gates, setModel semantics) instead of mocks.
+      - name: Smoke auto-fallback status surface
+        run: npm run smoke:auto-fallback
+
+  windows-opencode-relay:
+    name: Windows OpenCode Bun relay smoke
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      HOME: ${{ github.workspace }}/.smoke-artifacts/relay-home
+      USERPROFILE: ${{ github.workspace }}/.smoke-artifacts/relay-home
+      XDG_DATA_HOME: ${{ github.workspace }}/.smoke-artifacts/relay-home/data
+      XDG_CACHE_HOME: ${{ github.workspace }}/.smoke-artifacts/relay-home/cache
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # v7.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: "22"
+
+      # Without Bun, the real relay cases silently skip in the unit lane.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.4.4"
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Require real Bun and exercise the relay
+        run: |
+          bun --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npx --no-install vitest run `
+            tests/opencode-relay.test.ts `
+            tests/opencode-session-integration.test.ts `
+            tests/opencode-compat-stream.test.ts `
+            tests/opencode-dispatch.test.ts
 
   install-test:
     name: Install test (${{ matrix.os }})
@@ -100,8 +276,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # zizmor: artipacked - CI never pushes; no credential needed
+        with:
+          persist-credentials: false
 
-      # v7.0.0
+      # v7.1.0
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: "22"
@@ -118,17 +297,35 @@ jobs:
           TARBALL=$(ls pi-free-*.tgz)
           node scripts/check-tarball.mjs "$TARBALL"
 
+      # Gating: publint's findings are packaging errors (wrong `files`,
+      # unresolvable `main`/exports), not style. check-tarball.mjs pins
+      # the repo's own manifest rules; publint checks the tarball is
+      # consumable by a real installer. Exit code read directly, no pipe.
+      - name: Validate the packed tarball with publint
+        shell: bash
+        run: |
+          TARBALL=$(ls pi-free-*.tgz)
+          npx --no-install publint "$TARBALL"
+
       - name: Install from tarball (simulates pi install npm:pi-free)
         shell: bash
         run: |
           TARBALL=$(ls pi-free-*.tgz)
-          npm install -g "$TARBALL"
+          npm install -g "$TARBALL" # zizmor: ignore[adhoc-packages]
 
       - name: Install pi-free through Pi and verify RPC commands
         shell: bash
         run: |
           TARBALL=$(ls pi-free-*.tgz)
           npm run smoke:pi-install -- "$PWD/$TARBALL"
+
+      # Upgrade over the latest published release (seeds a realistic
+      # long-lived tree), then re-verify load + session + filter checks.
+      - name: Upgrade published release through Pi and re-verify
+        shell: bash
+        run: |
+          TARBALL=$(ls pi-free-*.tgz)
+          npm run smoke:pi-upgrade -- "$PWD/$TARBALL"
 
       - name: Verify published relative imports resolve
         shell: bash
@@ -151,3 +348,46 @@ jobs:
           echo "Loading compiled entry: $INSTALL_DIR/$ENTRY"
           node scripts/smoke-compiled.mjs "$INSTALL_DIR/$ENTRY"
           node scripts/smoke-pi-loader.mjs "$INSTALL_DIR/$ENTRY"
+
+      # #510: pi-ai was present but its own transitive dep (typebox) was
+      # unresolvable in the installed tree — a layout every load-only smoke
+      # above passes, while first real pi-ai use crashes. These two steps
+      # close that hole: the closure check proves the deps resolve, the
+      # entries smoke proves they execute. Both run on every matrix OS.
+      - name: Verify pi-ai transitive closure in installed tree (#510)
+        shell: bash
+        run: |
+          INSTALL_DIR=$(npm root -g)/pi-free
+          node scripts/check-installed-closure.mjs "$INSTALL_DIR"
+
+      - name: Execute pi-ai entries from installed tree (#510)
+        shell: bash
+        run: |
+          INSTALL_DIR=$(npm root -g)/pi-free
+          node scripts/smoke-pi-ai-entries.mjs "$INSTALL_DIR"
+
+      # #581: same hostile-layout detector as source-install-build, run on
+      # every matrix OS against the tree `pi install` actually produced.
+      - name: Recover pi-ai entries from a shadowed walk-up chain (#581)
+        shell: bash
+        run: |
+          INSTALL_DIR=$(npm root -g)/pi-free
+          node scripts/smoke-pi-ai-shadowed.mjs "$INSTALL_DIR"
+
+      - name: Verify pi-ai deps hoist canonically in installed tree
+        shell: bash
+        run: |
+          INSTALL_DIR=$(npm root -g)/pi-free
+          node scripts/check-hoisting.mjs "$INSTALL_DIR"
+
+      # Failure forensics: the smoke scripts preserve free.log/free.json
+      # into .smoke-artifacts/ on failure (the temp HOME is deleted).
+      # Upload them so a red install-test is debuggable from the run.
+      - name: Upload smoke failure artifacts
+        if: failure()
+        # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: smoke-artifacts-${{ matrix.os }}
+          path: .smoke-artifacts/
+          if-no-files-found: ignore

@@ -6,8 +6,10 @@
 ## Decision summary
 
 Use staged, leaf-first lazy loading rather than replacing the provider factory
-with awaited dynamic imports. The first experiment should defer Cline's XML
-bridge, then apply the same boundary to TokenRouter and OpenModel. A later
+with awaited dynamic imports. The first experiment deferred Cline's XML
+bridge (since superseded by #433, which deleted the bridge and moved Cline to
+the standard OpenAI api via the resulting lazy compat bridge), then applied the
+same boundary to TokenRouter and OpenModel. A later
 phase may introduce full provider stubs, but only if they preserve Pi's native
 provider contract. Qoder now uses the native provider lifecycle; its custom auth
 and protocol remain request-time concerns.
@@ -80,7 +82,7 @@ code, not a new catalog lifecycle.
 | --- | --- |
 | There are 17 static provider imports and all 17 setup functions are awaited. | Measured from `index.ts` source. |
 | `scripts/bench-startup.ts` reports `importMs`, `factoryMs`, and import-inclusive `totalMs` in warm, cold, and fast-cold modes. | Existing measurement capability. |
-| Native Cline, TokenRouter, and OpenModel setup paths do not fetch a catalog in their factory; Pi calls `refreshModels` later. | Observed in `providers/cline/cline-provider.ts`, `providers/tokenrouter/tokenrouter-provider.ts`, and `providers/openmodel/openmodel.ts`. |
+| Native Cline, TokenRouter, and OpenModel setup paths do not fetch a catalog in their factory; Pi calls `refreshModels` later. | Observed in `providers/cline/cline-provider.ts`, `providers/tokenrouter/tokenrouter.ts`, and `providers/openmodel/openmodel.ts`. |
 | A lazy boundary will reduce startup enough to matter to users. | Hypothesis; measure before and after. |
 | First-use dynamic-import latency will be imperceptible. | Hypothesis; measure and set a budget. |
 | Historical native migration measurements are the current baseline. | False. The roadmap's Kilo 7.0-second result and the old cold-path 66-to-8-second result are historical, not attribution for this change. |
@@ -91,20 +93,31 @@ infer a provider's import cost from its catalog or network timing.
 
 ## Provider-specific boundaries
 
-- **Cline:** `providers/cline/cline-provider.ts` currently imports
-  `streamClineXml` from `cline-xml-bridge.ts` at module evaluation. The native
+- **Cline:** `providers/cline/cline-provider.ts` streams through the shared
+  lazy compat bridge (`lazyOpenAICompletionsApi()`), like every other
+  OpenAI-compatible native provider — the custom XML bridge was removed when
+  Cline's endpoint became standard OpenAI Chat Completions (#433). The native
   provider object, `clineAuth`, public catalog refresh, `filterModels`, stored
   catalogs, and `registerNativeProviderRefresh()` must remain available before
-  the bridge is loaded. `stream` and `streamSimple` are the only natural first
-  boundary; both must continue to use request-scoped `buildClineHeaders()` and
-  preserve `rotateClineTaskId()` from `providers/cline/cline.ts`.
-- **TokenRouter:** `providers/tokenrouter/tokenrouter.ts` combines model mapping,
-  enrichment/fetching, reasoning normalization, payload patching, and the
-  high-load retry stream. `tokenrouter-provider.ts` owns the native Provider,
-  auth, store, toggle, registry, and session refresh. These responsibilities
-  should be split before attempting a full stub. The `before_provider_request`
-  and `message_end` hooks in `registerTokenRouterProvider()` must not disappear
-  while the implementation is unloaded.
+  compat is loaded, and `rotateClineTaskId()` keeps mutating the shared
+  headers record that every Cline model carries as its `headers` (pi-ai
+  merges only the model's headers into requests).
+- **TokenRouter:** `providers/tokenrouter/tokenrouter.ts` is a standard
+  OpenAI-compatible native provider registered through
+  `registerNativeOpenAIProvider()` — no custom API type and no custom wire
+  implementation. The `tokenrouter-openai-completions` bridge was removed so
+  the provider streams through pi-ai's standard `openai-completions` handling
+  via the shared lazy compat bridge, like Cline after #433. TokenRouter-specific
+  behavior is retained as thin seams on the standard provider: a
+  `before_provider_request` hook rewrites MiniMax-M3 `thinking.type`
+  `enabled` → `adaptive`, a `message_end` hook extracts MiniMax DeepSeek-style
+  inline think tags, the model compat is the shared `getProxyModelCompat` with
+  `supportsReasoningEffort` explicitly disabled (its chat completions route
+  rejects `reasoning_effort`) and re-stripped after models.dev enrichment, and
+  `stream`/`streamSimple` are wrapped with the 2064 high-load retry built on
+  the lazy bridge. Model mapping, enrichment/fetching, auth, store, toggle,
+  registry, and session refresh all live in this one file plus
+  `tokenrouter-auth.ts`.
 - **OpenModel:** `providers/openmodel/openmodel.ts` combines public/protocol
   catalog merging with the native Anthropic provider. Its `refreshModels` must
   still restore the native store offline, and its `stream`/`streamSimple` must
@@ -133,7 +146,10 @@ critical factory boundary and complicates provider names in `timeProvider()`.
 
 Keep a small eager provider shell and dynamically import code needed only on
 first request or online refresh. Cache the import promise so concurrent calls
-share one load. This is appropriate for Cline's XML bridge and can later be
+share one load. This was first applied to Cline's XML bridge (since deleted by
+
+# 433; Cline now uses the shared lazy compat bridge) and can later be
+
 used for TokenRouter/OpenModel stream and catalog helpers. Errors must be
 converted through the existing provider stream/error paths, not become an
 unhandled rejected import.
@@ -182,28 +198,25 @@ remaining bottleneck.
 3. Add a first-use measurement for a Cline request and a store-restored model
    picker, because the existing benchmark does not exercise a real request.
 
-### Stage 1 — defer Cline's XML bridge
+### Stage 1 — defer Cline's XML bridge (SUPERSEDED)
 
-1. In `providers/cline/cline-provider.ts`, replace the top-level
-   `streamClineXml` import with a cached dynamic loader used by both
-   `streamViaXmlBridge` entry points.
-2. Keep `createClineProvider()` synchronous and network-free. Do not move
-   `clineAuth`, catalog conversion, store restoration, filtering, toggle
-   registration, or `registerNativeProviderRefresh()` behind the loader.
-3. Preserve request-scoped headers and task-ID rotation. Ensure two concurrent
-   first requests share the same import promise and an import failure produces
-   the normal assistant error event.
-4. Run `tests/cline-provider.test.ts`, `tests/cline-xml-bridge.test.ts`,
-   `tests/cline.test.ts`, and `scripts/smoke-cline-xml-bridge.ts`, then repeat
-   the source/compiled benchmark.
+Superseded by #433: the Cline XML bridge was deleted entirely when Cline's
+endpoint became standard OpenAI Chat Completions; Cline now streams through
+the shared lazy compat bridge (`lazyOpenAICompletionsApi()`) that this roadmap
+produced.
+
+Historical plan: in `providers/cline/cline-provider.ts`, replace the top-level
+bridge import with a cached dynamic loader used by both stream entry points,
+keep `createClineProvider()` synchronous and network-free, preserve
+request-scoped headers and task-ID rotation, and ensure two concurrent first
+requests share the same import promise.
 
 ### Stage 2 — apply the boundary to TokenRouter and OpenModel
 
 1. Split protocol-heavy implementation from the eager shells. For TokenRouter,
    keep `createTokenRouterProvider()` and registration wiring in
-   `tokenrouter-provider.ts`; load model fetching and stream/normalization
-   dependencies from `tokenrouter.ts` only when refresh or a request needs
-   them.
+   `tokenrouter.ts`; load model fetching dependencies only when refresh needs
+   them (streaming already goes through the shared lazy compat bridge).
 2. For OpenModel, keep the native Provider shape, auth, stored catalogs,
    filtering, terms notification, and refresh/store wrapper eager; defer
    catalog mapping/fetch helpers and stream construction only where that does
@@ -251,7 +264,7 @@ baseline environment:
   dynamic path from the packaged `dist/` entry, not only from tsx source.
 
 Focused existing tests to extend include `cline-provider.test.ts`,
-`cline-xml-bridge.test.ts`, `tokenrouter-provider.test.ts`,
+`tokenrouter-provider.test.ts`,
 `openmodel.test.ts`, `native-filter-models.test.ts`, `registry.test.ts`, and
 `qoder.test.ts` (the last one guards the eager/legacy boundary).
 
@@ -290,9 +303,10 @@ loading.
   can skip native store restoration or make detached work block startup.
 - **Error/race risk:** concurrent first requests, aborts during import, and
   failed compiled paths need deterministic handling and no unhandled promise.
-- **Behavior risk:** Cline XML/tool parsing, TokenRouter MiniMax payload and
+- **Behavior risk:** TokenRouter MiniMax payload and
   message normalization, and OpenModel Anthropic streaming are wire contracts;
-  import timing must not change them.
+  import timing must not change them. (Cline's XML/tool parsing risk is gone:
+  the bridge was deleted by #433.)
 - **Measurement risk:** a faster import can be offset by factory work,
   first-request latency, or Pi's own model refresh. Keep all three timings and
   first-use measurements in reports.
@@ -308,8 +322,8 @@ loading.
   semantics.
 - [ ] Add first-use and concurrent-load tests for Cline, including failed import
   behavior and `streamSimple`.
-- [ ] Split TokenRouter protocol/fetch code from native registration; preserve
-  `registerTokenRouterProvider()` hooks and extend `tokenrouter-provider.test.ts`.
+- [ ] Split TokenRouter protocol/fetch code from native registration; extend
+  `tokenrouter-provider.test.ts` and `tokenrouter-free.test.ts`.
 - [ ] Split OpenModel protocol/fetch/stream code from its eager Provider shell;
   extend `openmodel.test.ts` and compiled smoke coverage.
 - [ ] Add a native lazy-stub contract test covering auth, store restoration,

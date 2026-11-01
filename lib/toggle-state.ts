@@ -10,6 +10,13 @@ export interface ToggleModelStore<T> {
 interface CreateToggleStateOptions<T> {
 	providerId: string;
 	initialShowPaid: boolean;
+	/**
+	 * Config key to persist under; defaults to `{providerId}_show_paid`.
+	 * Providers whose config key diverges from their registration id (e.g.
+	 * `opencode-free` → `opencode_free_show_paid`) must pass it so the
+	 * toggle survives a restart.
+	 */
+	configKey?: string | undefined;
 	save?: typeof saveConfig;
 	initialModels?: ToggleModelStore<T>;
 }
@@ -22,6 +29,7 @@ interface ToggleResult<T> {
 export function createToggleState<T>({
 	providerId,
 	initialShowPaid,
+	configKey = `${providerId}_show_paid`,
 	save = saveConfig,
 	initialModels,
 }: CreateToggleStateOptions<T>) {
@@ -36,14 +44,18 @@ export function createToggleState<T>({
 			return { mode: "free", models: stored.free };
 		}
 
-		if (stored.free.length > 0) {
-			return { mode: "free", models: stored.free };
-		}
-		return { mode: "all", models: stored.all };
+		// Strict: a free view with no free models resolves to an EMPTY free
+		// view, never to the paid catalog. Falling back to "all" here
+		// silently violated an explicit free-only choice (global or
+		// per-provider): a provider with zero free models hides from the
+		// picker instead of leaking paid models. Flipping to "all" stays
+		// available through an explicit toggle.
+		return { mode: "free", models: stored.free };
 	}
 
 	function persist(mode: ToggleMode): void {
-		save({ [`${providerId}_show_paid`]: mode === "all" });
+		// The toggle API is synchronous; persistence runs independently.
+		void save({ [configKey]: mode === "all" });
 	}
 
 	function applyMode(

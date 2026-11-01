@@ -15,51 +15,75 @@ import {
 	existsSync,
 	readFileSync,
 	statSync,
-	writeFileSync,
 } from "node:fs";
+import { withFileLock, writeFileAtomicSync } from "./lib/atomic-file.ts";
 import { join } from "node:path";
 import {
 	PROVIDER_ANYAPI,
 	PROVIDER_BAI,
+	PROVIDER_ORCAROUTER,
+	PROVIDER_XKIRO,
 	PROVIDER_CLINE,
 	PROVIDER_FASTROUTER,
+	PROVIDER_REQUESTY,
 	PROVIDER_STEPFUN,
+	PROVIDER_GMI,
+	PROVIDER_AGNES,
 	PROVIDER_KILO,
 	PROVIDER_OLLAMA,
 	PROVIDER_OPENCODE,
-	PROVIDER_OPENMODEL,
+	PROVIDER_OPENCODE_FREE,
+	PROVIDER_OPENCODE_GO,
 	PROVIDER_OPENROUTER,
 	PROVIDER_QODER,
 	PROVIDER_ROUTEWAY,
 	PROVIDER_OPENGATEWAY,
 	PROVIDER_TOKENROUTER,
 	PROVIDER_ZENMUX,
-	PROVIDER_CROFAI,
 	PROVIDER_LLM7,
 	PROVIDER_DEEPINFRA,
 	PROVIDER_SAMBANOVA,
 	PROVIDER_NOVITA,
+	PROVIDER_VENICE,
+	PROVIDER_INFRON,
+	PROVIDER_MERGE,
+	PROVIDER_COMMANDCODE,
 } from "./constants.ts";
-export {
-	PROVIDER_ANYAPI,
-	PROVIDER_BAI,
-	PROVIDER_CLINE,
-	PROVIDER_FASTROUTER,
-	PROVIDER_STEPFUN,
-	PROVIDER_KILO,
-	PROVIDER_OPENCODE,
-	PROVIDER_OPENROUTER,
-	PROVIDER_QODER,
-	PROVIDER_ROUTEWAY,
-	PROVIDER_TOKENROUTER,
-} from "./constants.ts";
+// SAFETY: This re-export is intentional — every provider module imports its
+// `PROVIDER_*` constant via `from "../../config.ts"` (see providers/kilo/kilo.ts,
+// providers/gmi/gmi.ts, etc.). Collapsing the import path into a single barrel
+// here keeps the import surface stable when constants move, and avoids forcing
+// every provider to add a second import line for `./constants.ts`. The cost
+// is that this file looks like a barrel — it isn't; it's the single source of
+// truth for runtime config (env vars, ~/.pi/free.json resolution, defaults)
+// and the provider-id constants happen to live alongside it.
+// Only CLINE and KILO are re-exported — they are the two ids consumed from
+// this module (kilo.ts, tests/config.test.ts); everything else imports from
+// ./constants.ts directly.
+export { PROVIDER_CLINE, PROVIDER_KILO } from "./constants.ts";
 import { createLogger } from "./lib/logger.ts";
 import { ensureDir, PI_DATA_DIR } from "./lib/paths.ts";
 
 /**
  * JSON.parse reviver that strips prototype-pollution payloads.
+ *
+ * The return type is the JSON value union extended with `undefined`, which
+ * JSON.parse uses to delete a key from the parsed object — it is what lets the
+ * reviver actually strip `__proto__` / `constructor` keys.
  */
-function safeJsonReviver(_key: string, value: unknown): unknown {
+type JsonReviverValue =
+	| string
+	| number
+	| boolean
+	| null
+	| { [key: string]: unknown }
+	| unknown[]
+	| undefined;
+
+function safeJsonReviver(
+	_key: string,
+	value: JsonReviverValue,
+): JsonReviverValue {
 	if (_key === "__proto__" || _key === "constructor") {
 		return undefined;
 	}
@@ -68,23 +92,41 @@ function safeJsonReviver(_key: string, value: unknown): unknown {
 
 const _logger = createLogger("config");
 
+/**
+ * Write-patch for free.json. Unlike Partial, members explicitly accept
+ * undefined: assigning undefined ERASES the key (saveConfig's
+ * JSON.stringify drop removes it). This is clearModelViewOverrides'
+ * mechanism — never widen a presence-sensitive READ type to match;
+ * omit the key instead.
+ */
+export type ConfigPatch = {
+	[K in keyof PiFreeConfig]?: PiFreeConfig[K] | undefined;
+};
+
 interface PiFreeConfig {
 	nvidia_api_key?: string;
 	ollama_api_key?: string;
 	zenmux_api_key?: string;
-	crofai_api_key?: string;
 	llm7_api_key?: string;
 	deepinfra_api_key?: string;
 	sambanova_api_key?: string;
 	novita_api_key?: string;
+	venice_api_key?: string;
+	infron_api_key?: string;
+	merge_api_key?: string;
+	commandcode_api_key?: string;
 	routeway_api_key?: string;
 	opengateway_api_key?: string;
 	fastrouter_api_key?: string;
+	requesty_api_key?: string;
 	stepfun_api_key?: string;
+	gmi_api_key?: string;
+	agnes_api_key?: string;
 	tokenrouter_api_key?: string;
 	anyapi_api_key?: string;
 	bai_api_key?: string;
-	openmodel_api_key?: string;
+	orcarouter_api_key?: string;
+	xkiro_api_key?: string;
 	kilo_api_key?: string;
 	cline_api_key?: string;
 	kilo_free_only?: boolean;
@@ -94,41 +136,85 @@ interface PiFreeConfig {
 	ollama_show_paid?: boolean;
 	cline_show_paid?: boolean;
 	zenmux_show_paid?: boolean;
-	crofai_show_paid?: boolean;
 	llm7_show_paid?: boolean;
 	deepinfra_show_paid?: boolean;
 	sambanova_show_paid?: boolean;
 	novita_show_paid?: boolean;
+	venice_show_paid?: boolean;
+	infron_show_paid?: boolean;
+	merge_show_paid?: boolean;
+	commandcode_show_paid?: boolean;
 	routeway_show_paid?: boolean;
 	opengateway_show_paid?: boolean;
 	fastrouter_show_paid?: boolean;
+	requesty_show_paid?: boolean;
 	stepfun_show_paid?: boolean;
+	gmi_show_paid?: boolean;
+	agnes_show_paid?: boolean;
 	tokenrouter_show_paid?: boolean;
 	anyapi_show_paid?: boolean;
 	bai_show_paid?: boolean;
-	openmodel_show_paid?: boolean;
+	orcarouter_show_paid?: boolean;
+	xkiro_show_paid?: boolean;
 	openrouter_show_paid?: boolean;
 	opencode_show_paid?: boolean;
+	opencode_free_show_paid?: boolean;
+	opencode_go_show_paid?: boolean;
 	qoder_show_paid?: boolean;
+
+	// Explicit per-provider catalog views, keyed by provider id. Sparse: only
+	// choices made through /toggle-<id> are recorded; absence means "follow
+	// the global free-only default". Legacy `{id}_show_paid` keys stay
+	// readable (an explicit `true` still counts) but are no longer written.
+	model_view_overrides?: { [providerId: string]: "free" | "all" };
+
+	// Auto-fallback configuration (see lib/auto-fallback/config.ts for
+	// resolution + defaults).
+	auto_fallback?: boolean;
+	auto_fallback_scope?: "provider" | "global" | "whitelist";
+	auto_fallback_providers?: string[];
+	auto_fallback_blacklist_ttl_ms?: number;
+	auto_fallback_blacklist_max?: number;
+	fallback_notify?: "silent" | "toast" | "status_bar" | "both";
+	fallback_restore?: "manual" | "auto_next_turn" | "auto_session_end";
+	// Re-issue the user's last prompt on the new model after a fallback
+	// switch (loop-bounded by `auto_fallback_auto_continue_max`).
+	auto_fallback_auto_continue?: boolean;
+	auto_fallback_auto_continue_max?: number;
+
+	// Legacy-host bridge (Oh My Pi and other hosts without native Provider
+	// registration): force registration via the two-argument
+	// `registerProvider(name, config)` form. Normally unnecessary — OMP is
+	// auto-detected (see shouldUseLegacyProviderBridge); this override
+	// covers OMP API drift and other legacy-only hosts. Stock Pi must never
+	// set it: the native single-arg path is the only correct one there.
+	oh_my_pi_compat?: boolean;
 }
 
 const CONFIG_TEMPLATE: PiFreeConfig = {
 	nvidia_api_key: "",
 	ollama_api_key: "",
 	zenmux_api_key: "",
-	crofai_api_key: "",
 	llm7_api_key: "",
 	deepinfra_api_key: "",
 	sambanova_api_key: "",
 	novita_api_key: "",
+	venice_api_key: "",
+	infron_api_key: "",
+	merge_api_key: "",
+	commandcode_api_key: "",
 	routeway_api_key: "",
 	opengateway_api_key: "",
 	fastrouter_api_key: "",
+	requesty_api_key: "",
 	stepfun_api_key: "",
+	gmi_api_key: "",
+	agnes_api_key: "",
 	tokenrouter_api_key: "",
 	anyapi_api_key: "",
 	bai_api_key: "",
-	openmodel_api_key: "",
+	orcarouter_api_key: "",
+	xkiro_api_key: "",
 	kilo_api_key: "",
 	cline_api_key: "",
 
@@ -139,22 +225,43 @@ const CONFIG_TEMPLATE: PiFreeConfig = {
 	ollama_show_paid: false,
 	cline_show_paid: false,
 	zenmux_show_paid: false,
-	crofai_show_paid: false,
 	llm7_show_paid: false,
 	deepinfra_show_paid: false,
 	sambanova_show_paid: false,
 	novita_show_paid: false,
+	venice_show_paid: false,
+	infron_show_paid: false,
+	merge_show_paid: false,
+	commandcode_show_paid: false,
 	routeway_show_paid: false,
 	opengateway_show_paid: false,
 	fastrouter_show_paid: false,
+	requesty_show_paid: false,
 	stepfun_show_paid: true,
+	gmi_show_paid: true,
+	agnes_show_paid: false,
 	tokenrouter_show_paid: false,
 	anyapi_show_paid: false,
 	bai_show_paid: false,
-	openmodel_show_paid: false,
+	orcarouter_show_paid: false,
+	xkiro_show_paid: false,
 	openrouter_show_paid: false,
 	opencode_show_paid: false,
+	opencode_free_show_paid: false,
+	opencode_go_show_paid: false,
 	qoder_show_paid: false,
+
+	// Auto-fallback defaults (lib/auto-fallback/config.ts reads these).
+	auto_fallback: false,
+	auto_fallback_scope: "provider",
+	auto_fallback_providers: [],
+	auto_fallback_blacklist_ttl_ms: 600000, // 10 minutes
+	auto_fallback_blacklist_max: 3,
+	fallback_notify: "toast",
+	fallback_restore: "manual",
+
+	// Legacy-host bridge is opt-in (see oh_my_pi_compat above).
+	oh_my_pi_compat: false,
 };
 
 const CONFIG_PATH = join(PI_DATA_DIR, "free.json");
@@ -162,7 +269,7 @@ const CONFIG_PATH = join(PI_DATA_DIR, "free.json");
 // Memoize the parsed config: re-read+parse only when the file's mtime changes.
 // loadConfigFile() is called on every config getter (dozens of times at
 // startup); this avoids repeated readFileSync + JSON.parse of the same file.
-// Every write path uses writeFileSync (which bumps mtime), so the mtime check
+// Every write path is atomic (tmp + rename with a new inode, which bumps mtime), so the mtime check
 // auto-invalidates after saveConfig()/updateConfig()/ensureConfigFile().
 let cachedConfig: PiFreeConfig | null = null;
 let cachedConfigMtime = -1;
@@ -176,17 +283,12 @@ function ensureConfigFile(): void {
 				existing = JSON.parse(
 					readFileSync(CONFIG_PATH, "utf8"),
 				) as PiFreeConfig;
-			} catch (_parseErr) {
+			} catch {
 				// File exists but is corrupt — back it up and write a fresh
 				// template so the extension can start. The original bytes are
 				// preserved in the timestamped backup for recovery.
 				backupCorruptConfigFile();
-				writeFileSync(
-					CONFIG_PATH,
-					`${JSON.stringify(CONFIG_TEMPLATE, null, 2)}\n`,
-					"utf8",
-				);
-				restrictConfigFilePermissions();
+				writeConfigFile(`${JSON.stringify(CONFIG_TEMPLATE, null, 2)}\n`);
 				_logger.warn(
 					"Config file was corrupt and has been reset from template; backup preserved",
 					{ path: CONFIG_PATH },
@@ -199,20 +301,10 @@ function ensureConfigFile(): void {
 			// Merge with template to add any missing keys, preserving existing values
 			const merged = { ...CONFIG_TEMPLATE, ...existing };
 			if (JSON.stringify(merged) !== JSON.stringify(existing)) {
-				writeFileSync(
-					CONFIG_PATH,
-					`${JSON.stringify(merged, null, 2)}\n`,
-					"utf8",
-				);
-				restrictConfigFilePermissions();
+				writeConfigFile(`${JSON.stringify(merged, null, 2)}\n`);
 			}
 		} else {
-			writeFileSync(
-				CONFIG_PATH,
-				`${JSON.stringify(CONFIG_TEMPLATE, null, 2)}\n`,
-				"utf8",
-			);
-			restrictConfigFilePermissions();
+			writeConfigFile(`${JSON.stringify(CONFIG_TEMPLATE, null, 2)}\n`);
 		}
 	} catch (err) {
 		_logger.warn("Could not create config file", {
@@ -366,7 +458,6 @@ const PROVIDER_META: readonly ProviderMeta[] = [
 	{ id: PROVIDER_KILO, prefix: "KILO", showPaidKey: "kilo_show_paid" },
 	{ id: PROVIDER_CLINE, prefix: "CLINE", showPaidKey: "cline_show_paid" },
 	{ id: PROVIDER_ZENMUX, prefix: "ZENMUX", showPaidKey: "zenmux_show_paid" },
-	{ id: PROVIDER_CROFAI, prefix: "CROFAI", showPaidKey: "crofai_show_paid" },
 	{ id: PROVIDER_LLM7, prefix: "LLM7", showPaidKey: "llm7_show_paid" },
 	{
 		id: PROVIDER_DEEPINFRA,
@@ -379,6 +470,14 @@ const PROVIDER_META: readonly ProviderMeta[] = [
 		showPaidKey: "sambanova_show_paid",
 	},
 	{ id: PROVIDER_NOVITA, prefix: "NOVITA", showPaidKey: "novita_show_paid" },
+	{ id: PROVIDER_VENICE, prefix: "VENICE", showPaidKey: "venice_show_paid" },
+	{ id: PROVIDER_INFRON, prefix: "INFRON", showPaidKey: "infron_show_paid" },
+	{ id: PROVIDER_MERGE, prefix: "MERGE", showPaidKey: "merge_show_paid" },
+	{
+		id: PROVIDER_COMMANDCODE,
+		prefix: "COMMANDCODE",
+		showPaidKey: "commandcode_show_paid",
+	},
 	{
 		id: PROVIDER_ROUTEWAY,
 		prefix: "ROUTEWAY",
@@ -397,19 +496,35 @@ const PROVIDER_META: readonly ProviderMeta[] = [
 	{ id: PROVIDER_ANYAPI, prefix: "ANYAPI", showPaidKey: "anyapi_show_paid" },
 	{ id: PROVIDER_BAI, prefix: "BAI", showPaidKey: "bai_show_paid" },
 	{
-		id: PROVIDER_OPENMODEL,
-		prefix: "OPENMODEL",
-		showPaidKey: "openmodel_show_paid",
+		id: PROVIDER_ORCAROUTER,
+		prefix: "ORCAROUTER",
+		showPaidKey: "orcarouter_show_paid",
 	},
+	{ id: PROVIDER_XKIRO, prefix: "XKIRO", showPaidKey: "xkiro_show_paid" },
 	{
 		id: PROVIDER_FASTROUTER,
 		prefix: "FASTROUTER",
 		showPaidKey: "fastrouter_show_paid",
 	},
 	{
+		id: PROVIDER_REQUESTY,
+		prefix: "REQUESTY",
+		showPaidKey: "requesty_show_paid",
+	},
+	{
 		id: PROVIDER_STEPFUN,
 		prefix: "STEPFUN",
 		showPaidKey: "stepfun_show_paid",
+	},
+	{
+		id: PROVIDER_GMI,
+		prefix: "GMI",
+		showPaidKey: "gmi_show_paid",
+	},
+	{
+		id: PROVIDER_AGNES,
+		prefix: "AGNES",
+		showPaidKey: "agnes_show_paid",
 	},
 	{ id: PROVIDER_OLLAMA, prefix: "OLLAMA", showPaidKey: "ollama_show_paid" },
 	{
@@ -421,6 +536,16 @@ const PROVIDER_META: readonly ProviderMeta[] = [
 		id: PROVIDER_OPENCODE,
 		prefix: "OPENCODE",
 		showPaidKey: "opencode_show_paid",
+	},
+	{
+		id: PROVIDER_OPENCODE_FREE,
+		prefix: "OPENCODE_FREE",
+		showPaidKey: "opencode_free_show_paid",
+	},
+	{
+		id: PROVIDER_OPENCODE_GO,
+		prefix: "OPENCODE_GO",
+		showPaidKey: "opencode_go_show_paid",
 	},
 	{ id: PROVIDER_QODER, prefix: "QODER", showPaidKey: "qoder_show_paid" },
 ];
@@ -442,6 +567,125 @@ function resolveShowPaidForProvider(providerId: string): boolean {
 	);
 }
 
+/**
+ * Explicit per-provider catalog view, or undefined to follow the global
+ * free-only default. Resolution order:
+ *
+ *   1. `model_view_overrides[providerId]` — written only by /toggle-<id>,
+ *      so presence alone proves an explicit choice (no template pollution).
+ *   2. Legacy `{id}_show_paid === true` — honors pre-existing explicit-all
+ *      choices across the upgrade. Only `true` counts: ensureConfigFile
+ *      materializes every key as `false` in existing files, so `false`
+ *      cannot distinguish "user chose free" from "never touched".
+ *   3. `<PREFIX>_SHOW_PAID` env var — a set var is always explicit.
+ */
+export type ModelViewChoice = "free" | "all";
+
+export function getModelViewOverride(
+	providerId: string,
+): ModelViewChoice | undefined {
+	return resolveViewOverrideFromConfig(
+		providerId,
+		loadConfigFile(),
+		PROVIDER_META_BY_ID.get(providerId),
+	);
+}
+
+/**
+ * Resolve an explicit per-provider view from a GIVEN config object.
+ * Folded out of getModelViewOverride so the locked read-modify-write
+ * (toggleModelViewOverride) resolves from the freshly-read config
+ * instead of the memoized cache — a stale read is what let two rapid
+ * toggles collapse into one (#603).
+ */
+function resolveViewOverrideFromConfig(
+	providerId: string,
+	cfg: PiFreeConfig,
+	meta: (typeof PROVIDER_META)[number] | undefined,
+): ModelViewChoice | undefined {
+	const explicit = cfg.model_view_overrides?.[providerId];
+	if (explicit === "free" || explicit === "all") return explicit;
+	if (!meta) return undefined;
+	const envVal = process.env[`${meta.prefix}_SHOW_PAID`];
+	if (envVal === "true") return "all";
+	if (envVal === "false") return "free";
+	if (cfg[meta.showPaidKey] === true) return "all";
+	return undefined;
+}
+
+/**
+ * Atomic toggle of a provider's catalog view: resolve, flip, and persist
+ * inside ONE locked config read-modify-write, returning the view that was
+ * applied. Both /toggle-<id> paths use this instead of
+ * read -> compute -> setModelViewOverride, which let two rapid toggles
+ * read the same pre-write state and collapse to a single net flip (#603).
+ */
+export async function toggleModelViewOverride(
+	providerId: string,
+): Promise<ModelViewChoice> {
+	const meta = PROVIDER_META_BY_ID.get(providerId);
+	let applied: ModelViewChoice = "free";
+	await updateConfig((current) => {
+		const effective =
+			resolveViewOverrideFromConfig(providerId, current, meta) ??
+			(resolveBool("PI_FREE_ONLY", current.free_only) ? "free" : "all");
+		applied = effective === "free" ? "all" : "free";
+		const patch: ConfigPatch = {
+			model_view_overrides: {
+				...current.model_view_overrides,
+				[providerId]: applied,
+			},
+		};
+		// Same legacy-key erase as setModelViewOverride: one write, one truth.
+		if (meta) patch[meta.showPaidKey] = undefined;
+		return patch;
+	});
+	return applied;
+}
+
+/**
+ * Record an explicit per-provider view choice. Merges into the sparse
+ * `model_view_overrides` map (never clobbers other providers' choices —
+ * saveConfig's shallow merge would) and drops the provider's legacy
+ * `{id}_show_paid` key so two sources can never disagree afterwards.
+ * Serialised through updateConfig's lock like every other RMW write.
+ */
+export async function setModelViewOverride(
+	providerId: string,
+	view: ModelViewChoice,
+): Promise<void> {
+	const meta = PROVIDER_META_BY_ID.get(providerId);
+	await updateConfig((current) => {
+		const patch: ConfigPatch = {
+			model_view_overrides: {
+				...current.model_view_overrides,
+				[providerId]: view,
+			},
+		};
+		// Erase the legacy snake_case key alongside the sparse-map write
+		// so the two representations can never disagree (explicit branch
+		// instead of a conditional spread).
+		if (meta) patch[meta.showPaidKey] = undefined;
+		return patch;
+	});
+}
+
+/**
+ * Delete every per-provider view choice — the sparse map plus all legacy
+ * `{id}_show_paid` keys — so every provider follows the global free-only
+ * default again. Used by /toggle-free: without this, a stale explicit
+ * choice keeps fighting the global flag on every new session (#510).
+ * JSON.stringify drops undefined values, so the merged write removes the
+ * keys from free.json; the mtime bump invalidates the memoized parse.
+ */
+export async function clearModelViewOverrides(): Promise<void> {
+	const cleared: ConfigPatch = { model_view_overrides: undefined };
+	for (const meta of PROVIDER_META_BY_ID.values()) {
+		cleared[meta.showPaidKey] = undefined;
+	}
+	await saveConfig(cleared);
+}
+
 // =============================================================================
 // Per-provider paid-model flags (getters so toggles reflect immediately)
 // =============================================================================
@@ -458,15 +702,13 @@ export function getZenmuxShowPaid(): boolean {
 	return resolveBool("ZENMUX_SHOW_PAID", loadConfigFile().zenmux_show_paid);
 }
 
-export function getCrofaiShowPaid(): boolean {
-	return resolveBool("CROFAI_SHOW_PAID", loadConfigFile().crofai_show_paid);
-}
-
 export function getLlm7ShowPaid(): boolean {
 	return resolveBool("LLM7_SHOW_PAID", loadConfigFile().llm7_show_paid);
 }
 
 export function getDeepinfraShowPaid(): boolean {
+	// Default to the free-only view like every other public-catalog freemium
+	// provider (Novita has the same trial-credit posture and defaults free).
 	return resolveBool(
 		"DEEPINFRA_SHOW_PAID",
 		loadConfigFile().deepinfra_show_paid,
@@ -482,6 +724,25 @@ export function getSambanovaShowPaid(): boolean {
 
 export function getNovitaShowPaid(): boolean {
 	return resolveBool("NOVITA_SHOW_PAID", loadConfigFile().novita_show_paid);
+}
+
+export function getVeniceShowPaid(): boolean {
+	return resolveBool("VENICE_SHOW_PAID", loadConfigFile().venice_show_paid);
+}
+
+export function getInfronShowPaid(): boolean {
+	return resolveBool("INFRON_SHOW_PAID", loadConfigFile().infron_show_paid);
+}
+
+export function getMergeShowPaid(): boolean {
+	return resolveBool("MERGE_SHOW_PAID", loadConfigFile().merge_show_paid);
+}
+
+export function getCommandCodeShowPaid(): boolean {
+	return resolveBool(
+		"COMMANDCODE_SHOW_PAID",
+		loadConfigFile().commandcode_show_paid,
+	);
 }
 
 export function getRoutewayShowPaid(): boolean {
@@ -510,11 +771,15 @@ export function getBaiShowPaid(): boolean {
 	return resolveBool("BAI_SHOW_PAID", loadConfigFile().bai_show_paid);
 }
 
-export function getOpenmodelShowPaid(): boolean {
+export function getOrcarouterShowPaid(): boolean {
 	return resolveBool(
-		"OPENMODEL_SHOW_PAID",
-		loadConfigFile().openmodel_show_paid,
+		"ORCAROUTER_SHOW_PAID",
+		loadConfigFile().orcarouter_show_paid,
 	);
+}
+
+export function getXkiroShowPaid(): boolean {
+	return resolveBool("XKIRO_SHOW_PAID", loadConfigFile().xkiro_show_paid);
 }
 
 export function getFastrouterShowPaid(): boolean {
@@ -524,11 +789,23 @@ export function getFastrouterShowPaid(): boolean {
 	);
 }
 
+export function getRequestyShowPaid(): boolean {
+	return resolveBool("REQUESTY_SHOW_PAID", loadConfigFile().requesty_show_paid);
+}
+
 export function getStepfunShowPaid(): boolean {
 	return resolveBool(
 		"STEPFUN_SHOW_PAID",
 		loadConfigFile().stepfun_show_paid ?? true,
 	);
+}
+
+export function getGmiShowPaid(): boolean {
+	return resolveBool("GMI_SHOW_PAID", loadConfigFile().gmi_show_paid ?? true);
+}
+
+export function getAgnesShowPaid(): boolean {
+	return resolveBool("AGNES_SHOW_PAID", loadConfigFile().agnes_show_paid);
 }
 
 export function getOllamaShowPaid(): boolean {
@@ -544,6 +821,20 @@ export function getOpenrouterShowPaid(): boolean {
 
 export function getOpencodeShowPaid(): boolean {
 	return resolveBool("OPENCODE_SHOW_PAID", loadConfigFile().opencode_show_paid);
+}
+
+export function getOpencodeFreeShowPaid(): boolean {
+	return resolveBool(
+		"OPENCODE_FREE_SHOW_PAID",
+		loadConfigFile().opencode_free_show_paid,
+	);
+}
+
+export function getOpencodeGoShowPaid(): boolean {
+	return resolveBool(
+		"OPENCODE_GO_SHOW_PAID",
+		loadConfigFile().opencode_go_show_paid,
+	);
 }
 
 export function getProviderShowPaid(providerId: string): boolean {
@@ -562,6 +853,16 @@ export function getKiloFreeOnly(): boolean {
 	return resolveBool("PI_FREE_KILO_FREE_ONLY", loadConfigFile().kilo_free_only);
 }
 
+/**
+ * Force the legacy two-argument provider bridge for hosts without native
+ * Provider registration (Oh My Pi). Normally unnecessary — the host is
+ * auto-detected; this override covers OMP API drift and other legacy-only
+ * hosts. Never enable on stock Pi.
+ */
+export function isOhMyPiCompat(): boolean {
+	return resolveBool("OH_MY_PI_COMPAT", loadConfigFile().oh_my_pi_compat);
+}
+
 // =============================================================================
 // API Keys (getters so runtime config changes are visible)
 // =============================================================================
@@ -572,10 +873,6 @@ export function getNvidiaApiKey(): string | undefined {
 
 export function getZenmuxApiKey(): string | undefined {
 	return resolve("ZENMUX_API_KEY", loadConfigFile().zenmux_api_key);
-}
-
-export function getCrofaiApiKey(): string | undefined {
-	return resolve("CROFAI_API_KEY", loadConfigFile().crofai_api_key);
 }
 
 export function getLlm7ApiKey(): string | undefined {
@@ -594,6 +891,22 @@ export function getNovitaApiKey(): string | undefined {
 	return resolve("NOVITA_API_KEY", loadConfigFile().novita_api_key);
 }
 
+export function getVeniceApiKey(): string | undefined {
+	return resolve("VENICE_API_KEY", loadConfigFile().venice_api_key);
+}
+
+export function getInfronApiKey(): string | undefined {
+	return resolve("INFRON_API_KEY", loadConfigFile().infron_api_key);
+}
+
+export function getMergeApiKey(): string | undefined {
+	return resolve("MERGE_API_KEY", loadConfigFile().merge_api_key);
+}
+
+export function getCommandCodeApiKey(): string | undefined {
+	return resolve("COMMAND_CODE_API_KEY", loadConfigFile().commandcode_api_key);
+}
+
 export function getRoutewayApiKey(): string | undefined {
 	return resolve("ROUTEWAY_API_KEY", loadConfigFile().routeway_api_key);
 }
@@ -606,8 +919,20 @@ export function getFastrouterApiKey(): string | undefined {
 	return resolve("FASTROUTER_API_KEY", loadConfigFile().fastrouter_api_key);
 }
 
+export function getRequestyApiKey(): string | undefined {
+	return resolve("REQUESTY_API_KEY", loadConfigFile().requesty_api_key);
+}
+
 export function getStepfunApiKey(): string | undefined {
 	return resolve("STEPFUN_API_KEY", loadConfigFile().stepfun_api_key);
+}
+
+export function getGmiApiKey(): string | undefined {
+	return resolve("GMI_API_KEY", loadConfigFile().gmi_api_key);
+}
+
+export function getAgnesApiKey(): string | undefined {
+	return resolve("AGNES_API_KEY", loadConfigFile().agnes_api_key);
 }
 
 export function getTokenrouterApiKey(): string | undefined {
@@ -622,8 +947,12 @@ export function getBaiApiKey(): string | undefined {
 	return resolve("BAI_API_KEY", loadConfigFile().bai_api_key);
 }
 
-export function getOpenmodelApiKey(): string | undefined {
-	return resolve("OPENMODEL_API_KEY", loadConfigFile().openmodel_api_key);
+export function getOrcarouterApiKey(): string | undefined {
+	return resolve("ORCAROUTER_API_KEY", loadConfigFile().orcarouter_api_key);
+}
+
+export function getXkiroApiKey(): string | undefined {
+	return resolve("XKIRO_API_KEY", loadConfigFile().xkiro_api_key);
 }
 
 export function getKiloApiKey(): string | undefined {
@@ -678,9 +1007,10 @@ export function getOpenrouterApiKey(): string | undefined {
 
 /** OpenCode key — pi's built-in provider. Read from env or auth.json. */
 export function getOpencodeApiKey(): string | undefined {
-	// Try "opencode" key first, then "opencode-go" — Pi may store OpenCode Go
-	// credentials under "opencode-go" (e.g. when logging in with /login opencode-go).
+	// Try "opencode-free" key first (e.g. /login opencode-free), then "opencode"
+	// and "opencode-go" — all share the same Zen API key.
 	return (
+		readAuthJsonKey("opencode-free", "OPENCODE_API_KEY") ??
 		readAuthJsonKey("opencode", "OPENCODE_API_KEY") ??
 		readAuthJsonKey("opencode-go", "OPENCODE_API_KEY")
 	);
@@ -703,6 +1033,11 @@ export function applyHidden<T extends { id: string }>(
 	const hidden = new Set(loadConfigFile().hidden_models ?? []);
 	if (hidden.size === 0) return models;
 
+	// Provider-wide hide (#572): `${providerId}/*` drops the provider's whole
+	// catalog without enumerating per-model entries. Written by
+	// /hide-provider and cleared by /show-provider.
+	if (providerId && hidden.has(`${providerId}/*`)) return [];
+
 	return models.filter((m) => {
 		// Check provider-scoped ID (preferred format: "provider/model-id")
 		if (providerId && hidden.has(`${providerId}/${m.id}`)) {
@@ -720,154 +1055,166 @@ export function applyHidden<T extends { id: string }>(
 // Persistence
 // =============================================================================
 
-export async function saveConfig(
-	updates: Partial<PiFreeConfig>,
-): Promise<void> {
-	const release = await _configLock.acquire();
-	try {
-		// Read the raw file content — never use loadConfigFile() here because
-		// if the file is unparsable, loadConfigFile() returns {} which would
-		// cause us to write a partial config and WIPE all existing keys.
-		const raw = readRawConfigFile();
-		if (raw === undefined) {
-			// File doesn't exist or can't be read — start from template
-			const merged = { ...CONFIG_TEMPLATE, ...updates };
-			writeFileSync(
-				CONFIG_PATH,
-				`${JSON.stringify(merged, null, 2)}\n`,
-				"utf8",
-			);
-			restrictConfigFilePermissions();
-			_logger.info("Config saved (new file)", {
-				path: CONFIG_PATH,
-				keys: Object.keys(updates),
-			});
-			return;
-		}
-
-		let base: PiFreeConfig;
-		try {
-			base = JSON.parse(raw, safeJsonReviver) as PiFreeConfig;
-		} catch (parseErr) {
-			// File exists but is corrupt. Back it up first, then write a fresh
-			// config so the user's original bytes are preserved for recovery.
-			backupCorruptConfigFile();
-			base = { ...CONFIG_TEMPLATE };
-			_logger.warn(
-				"Config file was corrupt; a backup was created and the next save will overwrite it",
-				{
-					path: CONFIG_PATH,
-					error:
-						parseErr instanceof Error ? parseErr.message : String(parseErr),
-				},
-			);
-		}
-
-		const merged = { ...base, ...updates };
-		writeFileSync(CONFIG_PATH, `${JSON.stringify(merged, null, 2)}\n`, "utf8");
-		restrictConfigFilePermissions();
-		_logger.info("Config saved", {
-			path: CONFIG_PATH,
-			keys: Object.keys(updates),
-		});
-	} catch (err) {
-		_logger.error("Failed to save config", {
-			path: CONFIG_PATH,
-			error: err instanceof Error ? err.message : String(err),
-		});
-	} finally {
-		release();
-	}
+/**
+ * Write the config file atomically (tmp + rename, #611) with owner-only
+ * permissions. Every CONFIG_PATH write funnels through here — never raw writes.
+ */
+function writeConfigFile(contents: string): void {
+	writeFileAtomicSync(CONFIG_PATH, contents, 0o600);
+	restrictConfigFilePermissions();
 }
 
 /**
- * Serialise all config RMW operations to prevent concurrent updates
- * from clobbering each other (e.g. two provider probes finishing at the
- * same time both writing hidden_models and losing the other's update).
+ * True when every model of `providerId` is hidden (#572). The marker is the
+ * `providerId/*` wildcard in `hidden_models`, so provider-wide hiding shares
+ * one store (and one cross-process lock) with per-model hiding.
  */
-class ConfigLock {
-	private promise: Promise<void> = Promise.resolve();
-
-	async acquire(): Promise<() => void> {
-		let release: () => void = () => {};
-		const newPromise = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		const previous = this.promise;
-		this.promise = previous.then(() => newPromise);
-		await previous;
-		return release;
-	}
+export function isProviderHidden(providerId: string): boolean {
+	return (loadConfigFile().hidden_models ?? []).includes(`${providerId}/*`);
 }
 
-const _configLock = new ConfigLock();
+/**
+ * Hide or show every model of one provider (#572). Atomic RMW over the
+ * `hidden_models` array, so concurrent toggles/probes cannot clobber each
+ * other; per-model entries for the provider are preserved (a later
+ * /show-provider reveals the provider but keeps individually hidden models).
+ * Returns the resulting hidden state.
+ */
+export async function setProviderHidden(
+	providerId: string,
+	hidden: boolean,
+): Promise<boolean> {
+	const marker = `${providerId}/*`;
+	await updateConfig((current) => {
+		const existing = new Set(current.hidden_models ?? []);
+		if (hidden) {
+			existing.add(marker);
+		} else {
+			existing.delete(marker);
+		}
+		return { hidden_models: Array.from(existing) };
+	});
+	return hidden;
+}
+
+export async function saveConfig(updates: ConfigPatch): Promise<void> {
+	return withFileLock(CONFIG_PATH, () => {
+		try {
+			// Read the raw file content — never use loadConfigFile() here because
+			// if the file is unparsable, loadConfigFile() returns {} which would
+			// cause us to write a partial config and WIPE all existing keys.
+			const raw = readRawConfigFile();
+			if (raw === undefined) {
+				// File doesn't exist or can't be read — start from template
+				const merged = { ...CONFIG_TEMPLATE, ...updates };
+				writeConfigFile(`${JSON.stringify(merged, null, 2)}\n`);
+				_logger.info("Config saved (new file)", {
+					path: CONFIG_PATH,
+					keys: Object.keys(updates),
+				});
+				return;
+			}
+
+			let base: PiFreeConfig;
+			try {
+				base = JSON.parse(raw, safeJsonReviver) as PiFreeConfig;
+			} catch (parseErr) {
+				// File exists but is corrupt. Back it up first, then write a fresh
+				// config so the user's original bytes are preserved for recovery.
+				backupCorruptConfigFile();
+				base = { ...CONFIG_TEMPLATE };
+				_logger.warn(
+					"Config file was corrupt; a backup was created and the next save will overwrite it",
+					{
+						path: CONFIG_PATH,
+						error:
+							parseErr instanceof Error ? parseErr.message : String(parseErr),
+					},
+				);
+			}
+
+			const merged = { ...base, ...updates };
+			writeConfigFile(`${JSON.stringify(merged, null, 2)}\n`);
+			_logger.info("Config saved", {
+				path: CONFIG_PATH,
+				keys: Object.keys(updates),
+			});
+		} catch (err) {
+			_logger.error("Failed to save config", {
+				path: CONFIG_PATH,
+				error: err instanceof Error ? err.message : String(err),
+			});
+		}
+	});
+}
+
+/**
+ * All config read-modify-write operations run inside the cross-process file
+ * lock (`withFileLock`, lib/atomic-file.ts), which also serialises callers
+ * within this process — the old in-process-only `ConfigLock` is gone (#611).
+ */
 
 /**
  * Atomically read-modify-write the config file. The updater function
  * receives the current parsed config and returns the partial updates to
- * merge. Concurrent calls are serialised by an internal lock.
+ * merge. Concurrent calls — including across processes — are serialised by
+ * the cross-process file lock, and the updater always sees a fresh disk
+ * read taken inside the lock.
  *
  * If the config file is corrupt, a backup is created first and the updater
  * is applied to a fresh template (the original bytes are preserved for
  * recovery).
  */
 export async function updateConfig(
-	updater: (current: PiFreeConfig) => Partial<PiFreeConfig>,
+	updater: (current: PiFreeConfig) => ConfigPatch,
 ): Promise<void> {
-	const release = await _configLock.acquire();
-	try {
-		const raw = readRawConfigFile();
-		if (raw === undefined) {
-			// File doesn't exist — start from template, apply updater once
-			const updated = updater({ ...CONFIG_TEMPLATE });
-			const merged = { ...CONFIG_TEMPLATE, ...updated };
-			writeFileSync(
-				CONFIG_PATH,
-				`${JSON.stringify(merged, null, 2)}\n`,
-				"utf8",
-			);
-			restrictConfigFilePermissions();
-			_logger.info("Config updated (new file)", {
+	return withFileLock(CONFIG_PATH, () => {
+		try {
+			const raw = readRawConfigFile();
+			if (raw === undefined) {
+				// File doesn't exist — start from template, apply updater once
+				const updated = updater({ ...CONFIG_TEMPLATE });
+				const merged = { ...CONFIG_TEMPLATE, ...updated };
+				writeConfigFile(`${JSON.stringify(merged, null, 2)}\n`);
+				_logger.info("Config updated (new file)", {
+					path: CONFIG_PATH,
+					keys: Object.keys(updated),
+				});
+				return;
+			}
+
+			let existing: PiFreeConfig;
+			try {
+				existing = JSON.parse(raw, safeJsonReviver) as PiFreeConfig;
+			} catch (parseErr) {
+				// File exists but is corrupt. Back it up first, then continue with
+				// the template as the base so the requested update can proceed.
+				backupCorruptConfigFile();
+				existing = { ...CONFIG_TEMPLATE };
+				_logger.warn(
+					"Config file was corrupt; a backup was created and the update will overwrite it",
+					{
+						path: CONFIG_PATH,
+						error:
+							parseErr instanceof Error ? parseErr.message : String(parseErr),
+					},
+				);
+			}
+
+			const updated = updater(existing);
+			const merged = { ...existing, ...updated };
+			writeConfigFile(`${JSON.stringify(merged, null, 2)}\n`);
+			_logger.info("Config updated", {
 				path: CONFIG_PATH,
 				keys: Object.keys(updated),
 			});
-			return;
+		} catch (err) {
+			_logger.error("Failed to update config", {
+				path: CONFIG_PATH,
+				error: err instanceof Error ? err.message : String(err),
+			});
 		}
-
-		let existing: PiFreeConfig;
-		try {
-			existing = JSON.parse(raw, safeJsonReviver) as PiFreeConfig;
-		} catch (parseErr) {
-			// File exists but is corrupt. Back it up first, then continue with
-			// the template as the base so the requested update can proceed.
-			backupCorruptConfigFile();
-			existing = { ...CONFIG_TEMPLATE };
-			_logger.warn(
-				"Config file was corrupt; a backup was created and the update will overwrite it",
-				{
-					path: CONFIG_PATH,
-					error:
-						parseErr instanceof Error ? parseErr.message : String(parseErr),
-				},
-			);
-		}
-
-		const updated = updater(existing);
-		const merged = { ...existing, ...updated };
-		writeFileSync(CONFIG_PATH, `${JSON.stringify(merged, null, 2)}\n`, "utf8");
-		restrictConfigFilePermissions();
-		_logger.info("Config updated", {
-			path: CONFIG_PATH,
-			keys: Object.keys(updated),
-		});
-	} catch (err) {
-		_logger.error("Failed to update config", {
-			path: CONFIG_PATH,
-			error: err instanceof Error ? err.message : String(err),
-		});
-	} finally {
-		release();
-	}
+	});
 }
 
 // =============================================================================

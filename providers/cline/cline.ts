@@ -1,8 +1,9 @@
 /**
  * Cline Provider Extension
  *
- * Provides access to Cline's models via their gateway, with the message flow
- * reshaped for the Cline API by the XML bridge (`cline-xml-bridge.ts`).
+ * Provides access to Cline's models via their gateway, which speaks vanilla
+ * OpenAI Chat Completions — models use the standard `openai-completions` api
+ * and stream through pi-ai's OpenAI implementation (lazy compat bridge).
  * Registered as a native pi-ai `Provider` (createProvider object form) so Pi
  * owns credential refresh, background model refresh, and offline initialization:
  *
@@ -21,29 +22,20 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import {
-	getClineApiKey,
-	getClineShowPaid,
-	PROVIDER_CLINE,
-} from "../../config.ts";
+import { getClineApiKey, PROVIDER_CLINE } from "../../config.ts";
 import { registerWithGlobalToggle } from "../../lib/registry.ts";
 import {
 	registerNativeProvider,
 	registerNativeProviderRefresh,
 	registerNativeProviderToggle,
 } from "../../lib/native-provider.ts";
-import {
-	createClineProvider,
-	registerClineXmlApiProvider,
-	rotateClineTaskId,
-} from "./cline-provider.ts";
+import { createClineProvider, rotateClineTaskId } from "./cline-provider.ts";
 
 // =============================================================================
 // Extension entry point
 // =============================================================================
 
 export default async function clineProvider(pi: ExtensionAPI) {
-	await registerClineXmlApiProvider();
 	const { provider, stored } = createClineProvider();
 
 	// Register the native provider. The factory performs NO network I/O: models
@@ -67,13 +59,14 @@ export default async function clineProvider(pi: ExtensionAPI) {
 	registerNativeProviderToggle(pi, {
 		providerId: PROVIDER_CLINE,
 		stored,
-		getShowPaid: getClineShowPaid,
 		reRegister,
 	});
 
 	// Rotate the Cline task id when a Cline agent starts (mirrors the legacy
-	// behavior). The XML bridge builds its request headers per request, so the
-	// new X-Task-ID takes effect immediately — no re-registration needed.
+	// behavior). The rotation mutates the shared headers record (see
+	// cline-headers.ts), which every Cline model holds as its `headers` —
+	// pi-ai merges only the model's headers into requests — so the new
+	// X-Task-ID takes effect immediately, no re-registration needed.
 	pi.on("before_agent_start", (_event, ctx) => {
 		if (ctx.model?.provider !== PROVIDER_CLINE) return;
 		rotateClineTaskId();

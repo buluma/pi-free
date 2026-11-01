@@ -7,14 +7,15 @@ import {
 	PROVIDER_ZENMUX,
 } from "../../constants.ts";
 import { safeEnrichModelsWithModelsDev } from "../../lib/model-metadata.ts";
+import { withGatewayCompat } from "../../lib/native-provider.ts";
 import { getProxyModelCompat } from "../../lib/provider-compat.ts";
 import { isFreeModel } from "../../lib/registry.ts";
-import { fetchWithRetry } from "../../lib/util.ts";
+import { fetchWithRetry, withSignal } from "../../lib/util.ts";
 import { createLogger } from "../../lib/logger.ts";
 
 const _logger = createLogger("zenmux-models");
 
-export interface ZenMuxModel {
+interface ZenMuxModel {
 	id: string;
 	display_name?: string;
 	context_length?: number;
@@ -31,34 +32,56 @@ export interface ZenMuxModel {
 }
 
 /** Extract ZenMux's per-million-token price as a per-token Pi cost. */
-export function extractZenmuxPrice(
+function extractZenmuxPrice(
 	pricings: ZenMuxModel["pricings"],
 	key: "prompt" | "completion" | "input_cache_read",
 ): number {
 	const entries = pricings?.[key];
 	if (!entries || entries.length === 0) return 0;
-	return (entries[0].value ?? 0) / 1_000_000;
+	// Length check above proves defined.
+	return (entries[0]!.value ?? 0) / 1_000_000;
 }
 
-/** Fetch and convert the authenticated ZenMux catalog. */
+/**
+ * Whether a catalog entry can produce chat text. ZenMux lists image/video
+ * generation, speech/transcription, embeddings and rerank endpoints alongside
+ * chat models; only text-output entries belong in the model picker. Entries
+ * with no `output_modalities` are kept (older/partial rows) to avoid
+ * over-filtering — the same rule the shared OpenRouter-compatible fetcher
+ * applies.
+ */
+function isChatModel(model: ZenMuxModel): boolean {
+	const outputModalities = model.output_modalities ?? [];
+	return outputModalities.length === 0 || outputModalities.includes("text");
+}
+
+/**
+ * Fetch and convert the ZenMux catalog. The catalog endpoint is public, so a
+ * missing token fetches anonymously (no Authorization header); a configured
+ * token is sent when present.
+ */
 export async function fetchZenmuxCatalog(options: {
-	token?: string;
+	token?: string | undefined;
 	signal?: AbortSignal;
 }): Promise<{ all: ProviderModelConfig[]; free: ProviderModelConfig[] }> {
-	if (!options.token || options.signal?.aborted) {
+	if (options.signal?.aborted) {
 		return { all: [], free: [] };
 	}
 
 	try {
 		const response = await fetchWithRetry(
 			`${BASE_URL_ZENMUX}/models`,
-			{
-				headers: {
-					Authorization: `Bearer ${options.token}`,
-					"Content-Type": "application/json",
+			withSignal(
+				{
+					headers: {
+						...(options.token && {
+							Authorization: `Bearer ${options.token}`,
+						}),
+						"Content-Type": "application/json",
+					},
 				},
-				signal: options.signal,
-			},
+				options.signal,
+			),
 			3,
 			1000,
 			DEFAULT_FETCH_TIMEOUT_MS,
@@ -69,7 +92,9 @@ export async function fetchZenmuxCatalog(options: {
 		}
 
 		const data = (await response.json()) as { data?: ZenMuxModel[] };
-		const mapped = (data.data ?? []).map((model) => {
+		// Chat entries only; see isChatModel.
+		const chatModels = (data.data ?? []).filter(isChatModel);
+		const mapped = chatModels.map((model) => {
 			const hasPricings = model.pricings !== undefined;
 			return {
 				id: model.id,
@@ -113,15 +138,15 @@ export async function fetchZenmuxCatalog(options: {
 	}
 }
 
-export function toZenmuxModel(
+function toZenmuxModel(
 	model: ProviderModelConfig,
 ): Model<"openai-completions"> {
-	return {
+	return withGatewayCompat({
 		...model,
 		api: "openai-completions",
 		provider: PROVIDER_ZENMUX,
 		baseUrl: model.baseUrl ?? BASE_URL_ZENMUX,
-	} as Model<"openai-completions">;
+	} as Model<"openai-completions">);
 }
 
 export function toZenmuxModels(

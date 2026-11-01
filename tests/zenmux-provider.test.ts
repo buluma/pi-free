@@ -10,6 +10,10 @@ const mockGetZenmuxApiKey = vi.hoisted(() =>
 	vi.fn((): string | undefined => undefined),
 );
 const mockGetZenmuxShowPaid = vi.hoisted(() => vi.fn(() => false));
+const mockGetModelViewOverride = vi.hoisted(() =>
+	vi.fn((_providerId: string): "free" | "all" | undefined => undefined),
+);
+const mockSetModelViewOverride = vi.hoisted(() => vi.fn());
 const mockGetGlobalFreeOnly = vi.hoisted(() => vi.fn(() => true));
 const mockApplyHidden = vi.hoisted(() =>
 	vi.fn((models: { id: string }[], _providerId?: string) => models),
@@ -19,6 +23,10 @@ const mockFetchWithRetry = vi.hoisted(() => vi.fn());
 vi.mock("../config.ts", () => ({
 	getZenmuxApiKey: () => mockGetZenmuxApiKey(),
 	getZenmuxShowPaid: () => mockGetZenmuxShowPaid(),
+	getModelViewOverride: (providerId: string) =>
+		mockGetModelViewOverride(providerId),
+	setModelViewOverride: (...args: unknown[]) =>
+		mockSetModelViewOverride(...args),
 	applyHidden: (models: { id: string }[], providerId?: string) =>
 		mockApplyHidden(models, providerId),
 	saveConfig: vi.fn(),
@@ -26,13 +34,26 @@ vi.mock("../config.ts", () => ({
 
 vi.mock("../lib/registry.ts", () => ({
 	getGlobalFreeOnly: () => mockGetGlobalFreeOnly(),
-	getGlobalFreeOnlyForced: () => false,
+	// Mirrors the real resolveModelView over the mocked config getters (the
+	// real rule is unit-tested in registry-provider-overrides.test.ts).
+	resolveModelView: (providerId: string) =>
+		mockGetModelViewOverride(providerId) ??
+		(mockGetZenmuxShowPaid()
+			? "all"
+			: mockGetGlobalFreeOnly()
+				? "free"
+				: "all"),
 	isFreeModel: (model: { cost?: { input?: number; output?: number } }) =>
 		(model.cost?.input ?? 0) === 0 && (model.cost?.output ?? 0) === 0,
 }));
 
 vi.mock("../lib/util.ts", () => ({
 	fetchWithRetry: (...args: unknown[]) => mockFetchWithRetry(...args),
+	// Mirror semantics: omit an undefined signal (RequestInit is lib.dom).
+	withSignal: (init: RequestInit, signal?: AbortSignal) => {
+		if (signal) init.signal = signal;
+		return init;
+	},
 }));
 
 vi.mock("../lib/model-metadata.ts", () => ({
@@ -126,6 +147,7 @@ beforeEach(() => {
 	vi.clearAllMocks();
 	mockGetZenmuxApiKey.mockReturnValue(undefined);
 	mockGetZenmuxShowPaid.mockReturnValue(false);
+	mockGetModelViewOverride.mockReturnValue(undefined);
 	mockGetGlobalFreeOnly.mockReturnValue(true);
 	mockApplyHidden.mockImplementation((models) => models);
 });
@@ -143,12 +165,13 @@ describe("createZenmuxProvider", () => {
 		const models = createModels();
 		models.setProvider(provider);
 		expect(await models.getAvailable()).toEqual([]);
-		// Keyed providers must not appear authenticated without a credential.
+		// Logged out: auth resolves undefined so Pi hides the provider
+		// from /model (#530) — the endpoint is public but chat needs a key.
 		expect(
 			await zenmuxAuth.apiKey?.resolve({
-			ctx: {} as never,
-			signal: new AbortController().signal,
-		} as never),
+				ctx: {} as never,
+				signal: new AbortController().signal,
+			} as never),
 		).toBeUndefined();
 	});
 
@@ -174,6 +197,9 @@ describe("createZenmuxProvider", () => {
 	});
 
 	it("fetches with the effective stored key and persists the catalog", async () => {
+		// All-view: pins persist mechanics, not view filtering.
+		mockGetModelViewOverride.mockReturnValue("all");
+
 		mockGetZenmuxApiKey.mockReturnValue("sk-ambient");
 		mockFetchWithRetry.mockResolvedValue(
 			response([
@@ -222,7 +248,7 @@ describe("createZenmuxProvider", () => {
 		expect(stored.all).toHaveLength(2);
 		expect(stored.free).toHaveLength(1);
 		expect(written).toHaveLength(1);
-		expect(written[0].models.map((model) => model.id)).toEqual([
+		expect(written[0]!.models.map((model) => model.id)).toEqual([
 			"free-model",
 			"paid-model",
 		]);
@@ -230,6 +256,8 @@ describe("createZenmuxProvider", () => {
 			"free-model",
 			"paid-model",
 		]);
+		// Pi applies filterModels under the free view resolved live below.
+		mockGetModelViewOverride.mockReturnValue(undefined);
 		expect(
 			provider.filterModels!(provider.getModels(), undefined).map(
 				(model) => model.id,
@@ -288,27 +316,57 @@ describe("createZenmuxProvider", () => {
 		expect(written).toHaveLength(0);
 	});
 
-	it("keeps the full catalog while filterModels selects the free view", async () => {
-		const { provider, stored } = createZenmuxProvider();
-		const free = nativeModel("free");
-		const paid = nativeModel("paid", true);
-		stored.free = [free];
-		stored.all = [free, paid];
-		expect(provider.getModels().map((model) => model.id)).toEqual([
-			"free",
-			"paid",
-		]);
-		expect(
-			provider.filterModels!(provider.getModels(), undefined).map(
-				(model) => model.id,
-			),
-		).toEqual(["free"]);
-	});
+	// NOTE (RPC migration): filter-view behavior is proven live by
+	// rpc-toggle-check (opencode-free free/all/persist phases). View
+	// resolution itself is pinned in registry-provider-overrides.test.ts
+	// against the real resolver.
 });
 
 describe("fetchZenmuxCatalog", () => {
-	it("returns an empty catalog without a token", async () => {
+	it("fetches the public catalog anonymously when no token is configured", async () => {
+		mockFetchWithRetry.mockResolvedValue(response([]));
 		expect(await fetchZenmuxCatalog({})).toEqual({ all: [], free: [] });
-		expect(mockFetchWithRetry).not.toHaveBeenCalled();
+		expect(mockFetchWithRetry).toHaveBeenCalledWith(
+			"https://zenmux.ai/api/v1/models",
+			expect.objectContaining({
+				headers: expect.not.objectContaining({
+					Authorization: expect.anything(),
+				}),
+			}),
+			3,
+			1000,
+			10_000,
+		);
+	});
+
+	it("drops non-chat (non-text-output) catalog entries", async () => {
+		mockFetchWithRetry.mockResolvedValue({
+			ok: true,
+			json: async () => ({
+				data: [
+					{
+						id: "text/chat",
+						display_name: "Chat",
+						output_modalities: ["text"],
+					},
+					{
+						id: "image/gen",
+						display_name: "Image",
+						output_modalities: ["image"],
+					},
+					{
+						id: "video/gen",
+						display_name: "Video",
+						output_modalities: ["video"],
+					},
+					{ id: "tts/gen", display_name: "TTS", output_modalities: ["speech"] },
+					{ id: "unknown/mod", display_name: "Unknown" },
+				],
+			}),
+		});
+
+		const { all } = await fetchZenmuxCatalog({});
+
+		expect(all.map((model) => model.id)).toEqual(["text/chat", "unknown/mod"]);
 	});
 });

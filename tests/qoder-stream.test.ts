@@ -98,11 +98,9 @@ function modelStub(id: string) {
 }
 
 function contextStub(messages: unknown[] = []) {
-	return {
-		messages,
-		systemPrompt: "",
-		tools: [],
-	} as any;
+	// Pi 0.86+ TranscriptContext shape: the system prompt and tools live in the
+	// transcript's system messages, so the stub only carries messages.
+	return { messages } as any;
 }
 
 function getMockStream(stream: unknown): MockStreamShape {
@@ -326,7 +324,7 @@ describe("Qoder stream parsing", () => {
 
 		await vi.waitFor(() => expect(fetchMock).toHaveBeenCalled());
 
-		const bodyRaw = fetchMock.mock.calls[0][1].body;
+		const bodyRaw = fetchMock.mock.calls[0]![1].body;
 		let body: Record<string, unknown>;
 		try {
 			body = JSON.parse(bodyRaw.toString());

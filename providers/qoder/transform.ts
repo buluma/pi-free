@@ -50,7 +50,7 @@ interface QoderMessage {
 /**
  * Extract text content from a message, joining all text/thinking blocks.
  */
-export function getContentText(msg: Message): string {
+function getContentText(msg: Message): string {
 	if (typeof msg.content === "string") return msg.content;
 	if (Array.isArray(msg.content)) {
 		return msg.content

@@ -42,7 +42,7 @@ import {
 	registerNativeAvailabilityProbe,
 	registerNativeOpenAIProvider,
 } from "../../lib/native-provider.ts";
-import { fetchWithRetry } from "../../lib/util.ts";
+import { fetchWithRetry, withSignal } from "../../lib/util.ts";
 import { novitaAuth } from "./novita-auth.ts";
 
 const _logger = createLogger("novita");
@@ -67,11 +67,30 @@ interface NovitaModel {
 	status?: number;
 }
 
+/**
+ * Internal Novita smoke-test models (`ai_infer_test_1..3`) are zero-priced and
+ * typed `chat`, but are not real inference endpoints. They carry no
+ * distinguishing structured metadata, so the id pattern is the only signal.
+ */
+const INTERNAL_TEST_MODEL_PATTERN = /^ai_infer_test/;
+
+/**
+ * Generation-output modalities: models producing these cannot serve as chat
+ * agents even when text is also listed (fastrouter applies the same rule
+ * through the shared fetcher's excludeOutputModalities).
+ */
+const NON_CHAT_OUTPUT_MODALITIES: ReadonlySet<string> = new Set([
+	"image",
+	"audio",
+	"video",
+	"speech",
+]);
+
 // =============================================================================
 // Fetch
 // =============================================================================
 
-async function fetchNovitaModels(
+export async function fetchNovitaModels(
 	apiKey: string,
 	signal?: AbortSignal,
 ): Promise<ProviderModelConfig[]> {
@@ -80,13 +99,15 @@ async function fetchNovitaModels(
 	try {
 		const response = await fetchWithRetry(
 			`${BASE_URL_NOVITA}/models`,
-			{
-				headers: {
-					Authorization: `Bearer ${apiKey}`,
-					"Content-Type": "application/json",
+			withSignal(
+				{
+					headers: {
+						...(apiKey && { Authorization: `Bearer ${apiKey}` }),
+						"Content-Type": "application/json",
+					},
 				},
 				signal,
-			},
+			),
 			3,
 			1000,
 			DEFAULT_FETCH_TIMEOUT_MS,
@@ -97,9 +118,21 @@ async function fetchNovitaModels(
 		}
 
 		const json = (await response.json()) as { data?: NovitaModel[] };
-		const models = (json.data ?? []).filter(
-			(m) => m.status === 1 && m.model_type === "chat",
-		);
+		const models = (json.data ?? [])
+			.filter((m) => m.status === 1 && m.model_type === "chat")
+			// Generation-output models (image/video/audio) cannot serve as
+			// chat agents even when text is also listed (2 live on
+			// 2026-10-15, #608). Vision *understanding* (input modalities)
+			// stays: it is legitimate chat input.
+			.filter(
+				(m) =>
+					!(m.output_modalities ?? []).some((mod) =>
+						NON_CHAT_OUTPUT_MODALITIES.has(mod),
+					),
+			)
+			// Novita exposes internal smoke-test entries (`ai_infer_test_1..3`)
+			// as zero-priced chat models; they are not usable endpoints.
+			.filter((m) => !INTERNAL_TEST_MODEL_PATTERN.test(m.id));
 
 		_logger.info(`[novita] Fetched ${models.length} models`);
 
@@ -139,6 +172,8 @@ async function fetchNovitaModels(
 			providerId: PROVIDER_NOVITA,
 		});
 	} catch (error) {
+		// Pi may abort a superseded refresh; cancellation is not a provider error.
+		if (signal?.aborted) return [];
 		_logger.error("[novita] Failed to fetch models:", {
 			error: error instanceof Error ? error.message : String(error),
 		});

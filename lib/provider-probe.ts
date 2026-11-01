@@ -37,7 +37,7 @@ const _logger = createLogger("provider-probe");
 // Types
 // =============================================================================
 
-export type ProbeModelFn = (
+type ProbeModelFn = (
 	apiKey: string,
 	modelId: string,
 ) => Promise<"ok" | "broken" | "unknown">;
@@ -71,7 +71,7 @@ export interface ProviderProbe {
 		models: ProviderModelConfig[],
 		options?: {
 			useCache?: boolean;
-			onBroken?: (brokenIds: string[]) => void;
+			onBroken?: ((brokenIds: string[]) => void) | undefined;
 		},
 	) => Promise<string[]>;
 

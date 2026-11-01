@@ -12,68 +12,164 @@ import type {
 	Model,
 	ProviderHeaders,
 	SimpleStreamOptions,
-	StreamFunction,
+	TranscriptContext,
 } from "@earendil-works/pi-ai/compat";
 import type {
 	ProviderConfig,
 	ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent";
+import {
+	DEFAULT_FETCH_TIMEOUT_MS,
+	PROVIDER_OPENCODE_FREE,
+} from "../constants.ts";
+import { loadPiAiEntry } from "../lib/pi-ai-loader.ts";
+import {
+	getOpenCodeRelay,
+	getOpenCodeRelayBaseUrl,
+} from "../lib/opencode-relay.ts";
+import { isChatModelConfig } from "../lib/types.ts";
 
 export const OPENCODE_DYNAMIC_API = "opencode-dynamic" as const;
 
-export const OPENCODE_STATIC_HEADERS = {
-	"User-Agent": "opencode/1.15.5",
+/**
+ * Zen's anonymous bearer. opencode-free sends this instead of the account
+ * credential because the keyed free-tier lane is rejected upstream ("Model
+ * access is disabled"), while the literal `public` bearer is treated as
+ * anonymous and accepted. Sent only when `createOpenCodeStreamSimple` is
+ * constructed with `{ anonymous: true }` (the opencode-free provider).
+ */
+const OPENCODE_ANONYMOUS_API_KEY = "public";
+
+// #628: live subset probes require an env frame with a working-directory line,
+// not OpenCode's persona/tools/skills prompt. Dot is relative to Pi's tool cwd;
+// keep the complete Pi instructions after this small request-only metadata.
+const OPENCODE_FREE_SYSTEM_ENVELOPE = "<env>Working directory: .</env>";
+
+const OPENCODE_STATIC_HEADERS = {
+	"User-Agent": "opencode/1.19.0",
 	"x-opencode-client": "cli",
 } as const;
+
+/**
+ * Fetch the public OpenCode Zen catalog. The endpoint intentionally returns
+ * only model ids, so callers merge those ids with Pi's richer built-in model
+ * metadata. Keep this as a small, one-shot request: it runs after session
+ * start and must never become part of extension initialization.
+ */
+export async function fetchOpenCodeModelIds(
+	baseUrl: string,
+	signal?: AbortSignal,
+): Promise<string[]> {
+	const timeoutSignal = AbortSignal.timeout(DEFAULT_FETCH_TIMEOUT_MS);
+	const requestSignal = signal
+		? AbortSignal.any([signal, timeoutSignal])
+		: timeoutSignal;
+	const response = await fetch(`${baseUrl.replace(/\/+$/u, "")}/models`, {
+		headers: {
+			...OPENCODE_STATIC_HEADERS,
+			Accept: "application/json",
+		},
+		signal: requestSignal,
+	});
+	if (!response.ok) {
+		throw new Error(`OpenCode model catalog returned HTTP ${response.status}`);
+	}
+
+	const payload: unknown = await response.json();
+	if (!payload || typeof payload !== "object") {
+		throw new Error("OpenCode model catalog returned an invalid response");
+	}
+	const data = (payload as { data?: unknown }).data;
+	if (!Array.isArray(data)) {
+		throw new Error("OpenCode model catalog returned no model list");
+	}
+
+	const ids = [
+		...new Set(
+			data
+				.filter(
+					(item): item is { id: string } =>
+						item !== null &&
+						typeof item === "object" &&
+						typeof (item as { id?: unknown }).id === "string" &&
+						(item as { id: string }).id.length > 0,
+				)
+				.map((item) => item.id),
+		),
+	];
+	// Empty is not an error here: callers retain the cached catalog on an
+	// empty response (poisoning guard, same rule as refreshModels). Only a
+	// malformed payload throws.
+	return ids;
+}
 
 /**
  * OpenCode-native identifier generation.
  *
  * OpenCode's server uses checkHeaders to distinguish native CLI requests from
- * third-party clients.  Native identifiers use ULID-style prefixes:
+ * third-party clients, and applies a fallback rate limit (~2 req/day, the
+ * "freeze") when the identity looks foreign. The real CLI (v1.19.0,
+ * packages/opencode/src/session/llm/request.ts) sends:
  *
- *   Session:  ses_<hex><base62>   (e.g. ses_a1b2c3d4e5f6g7h8i9j0k1l2m3n4)
- *   Request:  msg_<hex><base62>   (e.g. msg_01KA1B2C3D4E5F6G7H8I9J0K1L2M)
+ *   x-opencode-session:  ses_ + descending ULID (26 chars: 12 hex + 14 base62)
+ *   x-opencode-request:  msg_ + ascending ULID (the user message id)
+ *   x-opencode-project:  the project id (schema default "global")
+ *   x-opencode-client:   "cli" (OPENCODE_CLIENT default)
+ *   User-Agent:          opencode/<version>
  *
- * If the server does not see the expected prefix it applies a fallback rate
- * limit (~2 req/day) which causes models to "freeze" after a few prompts.
+ * The ULID is `~timestamp<<12 | counter` encoded as 6 hex bytes then 14
+ * base62 bytes (crypto random) — see packages/schema/src/identifier.ts.
  */
-function generateOpenCodeId(prefix: string): string {
-	// Timestamp in ms as big-endian hex (matches ULID-style sortability).
-	const ms = BigInt(Date.now());
-	const timeHex = ms.toString(16).padStart(12, "0");
-	// Random suffix (crypto) encoded as base62 for compactness.
-	const randomLen = 14;
-	const base62Chars =
-		"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-	const bytes = randomBytes(randomLen);
-	let suffix = "";
-	for (let i = 0; i < randomLen; i++) {
-		suffix += base62Chars[bytes[i] % 62];
+const OPENCODE_ID_CHARS =
+	"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+// Mirror the CLI's module-level timestamp/counter for exact ULID shape.
+let _lastUlidTimestamp = 0;
+let _ulidCounter = 0;
+
+function openCodeUlid(descending: boolean): string {
+	const timestamp = Date.now();
+	if (timestamp !== _lastUlidTimestamp) {
+		_lastUlidTimestamp = timestamp;
+		_ulidCounter = 0;
 	}
-	return `${prefix}${timeHex}${suffix}`;
+	_ulidCounter += 1;
+
+	const current = BigInt(timestamp) * 0x1000n + BigInt(_ulidCounter);
+	const value = descending ? ~current : current;
+	const time = Array.from({ length: 6 }, (_, index) =>
+		Number((value >> BigInt(40 - 8 * index)) & 0xffn)
+			.toString(16)
+			.padStart(2, "0"),
+	).join("");
+	const bytes = crypto.getRandomValues(new Uint8Array(14));
+	return (
+		time + Array.from(bytes, (byte) => OPENCODE_ID_CHARS[byte % 62]).join("")
+	);
 }
 
 /**
  * Shared OpenCode session/request tracking.
  *
- * OpenCode endpoints require native-format identifiers (ses_ / msg_ prefix)
- * to receive the full daily rate limit.  Without matching prefixes the server
- * falls back to a ~2 req/day limit, causing free models to freeze after a
- * couple of prompts.
+ * OpenCode endpoints require native-format identifiers to receive the full
+ * daily rate limit: session ids are `ses_` + descending ULID, request ids are
+ * `msg_` + ascending ULID (the CLI sends the user message id as
+ * x-opencode-request). Since 2026-10-15 the free tier answers a `prt_` id
+ * with 403 FreeTierError.
+ * Without matching prefixes the server falls back to a ~2 req/day limit.
  */
 export function createOpenCodeSessionTracker() {
 	let sessionId = "";
 
 	function getSessionId(): string {
 		if (!sessionId) {
-			sessionId = generateOpenCodeId("ses_");
+			sessionId = "ses_" + openCodeUlid(true);
 		}
 		return sessionId;
 	}
 
 	function nextRequestId(): string {
-		return generateOpenCodeId("msg_");
+		return "msg_" + openCodeUlid(false);
 	}
 
 	return {
@@ -95,11 +191,19 @@ export function createOpenCodeHeaders(
 		...OPENCODE_STATIC_HEADERS,
 		"x-opencode-session": tracker.getSessionId(),
 		"x-opencode-request": tracker.nextRequestId(),
+		// The CLI sends the project id when present (schema default "global").
+		// Headers alone do not establish free-tier acceptance; the anonymous
+		// path also supplies request-only environment metadata and Bun transport.
+		"x-opencode-project": "global",
 	};
 }
 
 export function isOpenCodeProvider(providerId: string): boolean {
-	return providerId === "opencode" || providerId === "opencode-go";
+	return (
+		providerId === "opencode" ||
+		providerId === "opencode-free" ||
+		providerId === "opencode-go"
+	);
 }
 
 export function resolveOpenCodeModelApi(
@@ -123,6 +227,13 @@ export function resolveOpenCodeModelApi(
 	return "openai-completions";
 }
 
+// The CLI (v1.19.0) sends Zen traffic to /inference/v1. Since 2026-10-15
+// /zen/v1 refuses every free-tier request with 403 FreeTierError, including
+// ones copied byte for byte from the CLI. Captured Pi catalogs and persisted
+// caches still carry /zen/v1, so rewrite it here. /zen/go/v1 is left alone.
+const OPENCODE_ZEN_ROOT = /^https:\/\/opencode\.ai\/zen$/u;
+const OPENCODE_INFERENCE_ROOT = "https://opencode.ai/inference";
+
 export function getOpenCodeModelBaseUrl(
 	_api: NonNullable<Api>,
 	fallbackBaseUrl: string,
@@ -132,7 +243,9 @@ export function getOpenCodeModelBaseUrl(
 	// Older Pi catalogs used /zen/messages for Anthropic models, which now
 	// resolves to the website's HTML 404 page.
 	void _api; // Kept in the helper signature for callers that pass the wire API.
-	const root = fallbackBaseUrl.replace(/\/v1\/?$/u, "");
+	const root = fallbackBaseUrl
+		.replace(/\/v1\/?$/u, "")
+		.replace(OPENCODE_ZEN_ROOT, OPENCODE_INFERENCE_ROOT);
 	return `${root}/v1`;
 }
 
@@ -141,7 +254,9 @@ export function applyOpenCodeProtocolDefaults(
 	providerId: string,
 	fallbackBaseUrl: string,
 ): ProviderModelConfig[] {
-	return models.map((model) => {
+	// Chat-only catalog: image/classifier entries cannot be served through
+	// the chat stream wrappers (pi 1.x union).
+	return models.filter(isChatModelConfig).map((model) => {
 		const api = resolveOpenCodeModelApi(model.id, providerId, model.api);
 		const compat =
 			api === "openai-responses"
@@ -161,11 +276,12 @@ export function applyOpenCodeProtocolDefaults(
 	});
 }
 
-function resolveOpenCodeStreamApi(model: Model<Api>): string {
-	if (model.api === OPENCODE_DYNAMIC_API) {
-		return resolveOpenCodeModelApi(model.id, model.provider, model.api);
-	}
-	return model.api;
+function resolveOpenCodeStreamApi(
+	model: Model<Api>,
+	getModelApi?: (modelId: string) => Api | undefined,
+): string {
+	const api = getModelApi?.(model.id) ?? model.api;
+	return resolveOpenCodeModelApi(model.id, model.provider, api);
 }
 
 type StreamSimpleFn<TApi extends Api> = (
@@ -218,12 +334,53 @@ async function importPiAiSubpathUncached<T>(specifier: string): Promise<T> {
 		if (rootFallback) return rootFallback;
 
 		const resolved = resolvePiAiSubpathFromPackage(specifier);
-		if (!resolved) throw directError;
+		if (!resolved) {
+			// Last resort for Bun-compiled pi binaries: no bare specifier
+			// resolves from external files there, so reach the vendored
+			// bundle's API factories through the shared loader (#502).
+			const vendored = await importPiAiVendoredApiStreams<T>(specifier);
+			if (vendored) return vendored;
+			throw directError;
+		}
 		try {
 			return (await import(pathToFileURL(resolved).href)) as T;
 		} catch {
 			throw directError;
 		}
+	}
+}
+
+/**
+ * Maps the api subpaths this module imports to the API-factory export names
+ * shared by pi-ai's real `compat` entry and pi-free's vendored bundle.
+ */
+const VENDORED_API_FACTORIES: Record<string, string> = {
+	"api/anthropic-messages": "anthropicMessagesApi",
+	"api/google-generative-ai": "googleGenerativeAIApi",
+	"api/openai-completions": "openAICompletionsApi",
+	"api/openai-responses": "openAIResponsesApi",
+};
+
+/**
+ * Builds a streamSimple-carrying module from the loader's compat entry when no
+ * importable pi-ai copy exists on disk. Works uniformly for the real compat
+ * module and the vendored bundle; the factories are pi-ai's lazy wrappers, so
+ * calling them does not load the provider implementation until first use.
+ */
+async function importPiAiVendoredApiStreams<T>(
+	specifier: string,
+): Promise<T | undefined> {
+	const subpath = specifier.replace("@earendil-works/pi-ai/", "");
+	const factoryName = VENDORED_API_FACTORIES[subpath];
+	if (!factoryName) return undefined;
+	try {
+		const compat = await loadPiAiEntry<Record<string, unknown>>("compat");
+		const factory = compat[factoryName];
+		if (typeof factory !== "function") return undefined;
+		const streams = (factory as () => unknown)();
+		return streams as T;
+	} catch {
+		return undefined;
 	}
 }
 
@@ -246,10 +403,12 @@ async function importPiAiRootFallback<T>(
 	if (!exportName) return undefined;
 
 	try {
-		const rootModule = (await import("@earendil-works/pi-ai")) as Record<
-			string,
-			unknown
-		>;
+		// Routed through the shared loader (disk fallback + vendored bundle);
+		// compat is a strict superset of the bare pi-ai root, including the
+		// legacy streamSimple* aliases. The vendored last-resort bundle does
+		// not carry the legacy aliases, so Bun-binary hosts return undefined
+		// here and the caller's normal path takes over.
+		const rootModule = await loadPiAiEntry<Record<string, unknown>>("compat");
 		return typeof rootModule[exportName] === "function"
 			? (rootModule as T)
 			: undefined;
@@ -259,7 +418,6 @@ async function importPiAiRootFallback<T>(
 }
 
 const PI_AI_DEPENDENCY_CANARY = "openai";
-
 function findPiAiPackageDir(requireBase: string): string | undefined {
 	try {
 		const require = createRequire(requireBase);
@@ -455,11 +613,63 @@ async function pipeStream(
  * provider-specific stream keeps the normal Pi parsers but refreshes headers for
  * every LLM call.
  */
+/**
+ * PI_FREE_OPENCODE_RELAY="0" turns the bun TLS relay off (anonymous direct
+ * lane only). Default on: the anonymous free lane rejects non-bun TLS
+ * fingerprints upstream (~2 req/day), and bun restores full service.
+ */
+const relaysAnonymousLane = (): boolean =>
+	process.env.PI_FREE_OPENCODE_RELAY !== "0";
+
+/**
+ * The relay cannot start synchronously (the child reports its port from
+ * stdout), but the stream plumbing already runs inside an async body — so
+ * awaiting the bind here keeps the streaming contract intact. When the relay
+ * is unavailable (missing bun, bind failure) the request falls through to the
+ * direct anonymous lane untouched: the failure is the upstream's own
+ * fingerprint gate, never a new error class we invent.
+ */
+export const relayWindowMs = 2000;
+
+async function maybeRelayBaseUrl(original: string): Promise<{
+	baseUrl: string;
+	release?: () => void;
+}> {
+	if (!relaysAnonymousLane()) {
+		return { baseUrl: original };
+	}
+	const relay = getOpenCodeRelay();
+	const release = relay.acquire();
+	try {
+		const port = await relay.ready(relayWindowMs);
+		return {
+			baseUrl: getOpenCodeRelayBaseUrl(original, port) ?? original,
+			release,
+		};
+	} catch {
+		release();
+		return { baseUrl: original }; // direct lane; startup failure is already logged
+	}
+}
+
 export function createOpenCodeStreamSimple(
 	tracker: OpenCodeSessionTracker,
+	settings?: {
+		anonymous?: boolean;
+		/** Original wire API from the live catalog, before dispatch stamping. */
+		getModelApi?: (modelId: string) => Api | undefined;
+	},
 ): NonNullable<ProviderConfig["streamSimple"]> {
-	return (model, context, options?) => {
+	// opencode-free must not send the account key: the keyed free-tier lane is
+	// disabled upstream, so every keyed request 403s with "Model access is
+	// disabled". The anonymous `public` bearer is accepted. opencode-go keeps
+	// the credential (its own `lite` lane).
+	const anonymous = settings?.anonymous === true;
+	return (model, context, options) => {
 		const headers = createOpenCodeHeaders(tracker, options?.headers);
+		const requestOptions = anonymous
+			? { ...options, apiKey: OPENCODE_ANONYMOUS_API_KEY }
+			: options;
 		const stream = new DeferredAssistantMessageEventStream();
 
 		// Sanitize context messages for Anthropic/OpenAI compatibility.
@@ -469,23 +679,60 @@ export function createOpenCodeStreamSimple(
 		const sanitizedMessages = sanitizeMessagesForOpenCode(
 			context.messages as unknown[],
 		);
-		const sanitizedContext: Context = {
+		let sanitizedContext: Context = {
 			...context,
 			messages: sanitizedMessages as Context["messages"],
 		};
 
 		void (async () => {
+			let releaseRelay: (() => void) | undefined;
 			try {
-				const streamApi = resolveOpenCodeStreamApi(model);
-				// Normalize here as well as during catalog conversion because Pi can
-				// supply a previously persisted model with the pre-/v1 URL.
-				const normalizedModel = {
-					...model,
-					baseUrl: getOpenCodeModelBaseUrl(
-						streamApi as NonNullable<Api>,
-						model.baseUrl,
-					),
-				};
+				if (anonymous) {
+					const { normalizeContext } = await loadPiAiEntry<{
+						normalizeContext(context: Context): TranscriptContext;
+					}>("compat");
+					// The sanitizer already owns a fresh request array; normalization
+					// may also fold legacy prompt/tools into a fresh leading message.
+					const messages = normalizeContext(sanitizedContext).messages;
+					const initial = messages[0];
+					if (initial?.role === "system") {
+						messages[0] = {
+							...initial,
+							content:
+								typeof initial.content === "string"
+									? `${OPENCODE_FREE_SYSTEM_ENVELOPE}\n\n${initial.content}`
+									: [
+											{
+												type: "text",
+												text: `${OPENCODE_FREE_SYSTEM_ENVELOPE}\n\n`,
+											},
+											...initial.content,
+										],
+						};
+					} else {
+						messages.unshift({
+							role: "system",
+							content: OPENCODE_FREE_SYSTEM_ENVELOPE,
+							timestamp: 0,
+						});
+					}
+					sanitizedContext = { messages };
+				}
+				const streamApi = resolveOpenCodeStreamApi(
+					model,
+					settings?.getModelApi,
+				);
+				const upstreamBaseUrl = getOpenCodeModelBaseUrl(
+					streamApi as NonNullable<Api>,
+					model.baseUrl,
+				);
+				const relayed = anonymous
+					? await maybeRelayBaseUrl(upstreamBaseUrl)
+					: { baseUrl: upstreamBaseUrl };
+				releaseRelay = relayed.release;
+				// Normalize persisted URLs too; keep the relay held across protocol
+				// loading and the entire stream, not just until headers arrive.
+				const normalizedModel = { ...model, baseUrl: relayed.baseUrl };
 				if (streamApi === "anthropic-messages") {
 					const streamSimpleAnthropic = getStreamSimple(
 						await importPiAiSubpath<AnthropicStreamModule>(
@@ -501,7 +748,7 @@ export function createOpenCodeStreamSimple(
 								api: "anthropic-messages",
 							} as Model<"anthropic-messages">,
 							sanitizedContext,
-							{ ...options, headers },
+							{ ...requestOptions, headers },
 						),
 					);
 					return;
@@ -522,7 +769,7 @@ export function createOpenCodeStreamSimple(
 								api: "google-generative-ai",
 							} as Model<"google-generative-ai">,
 							sanitizedContext,
-							{ ...options, headers },
+							{ ...requestOptions, headers },
 						),
 					);
 					return;
@@ -543,7 +790,7 @@ export function createOpenCodeStreamSimple(
 								api: "openai-responses",
 							} as Model<"openai-responses">,
 							sanitizedContext,
-							{ ...options, headers },
+							{ ...requestOptions, headers },
 						),
 					);
 					return;
@@ -563,16 +810,20 @@ export function createOpenCodeStreamSimple(
 							api: "openai-completions",
 						} as Model<"openai-completions">,
 						sanitizedContext,
-						{ ...options, headers },
+						{ ...requestOptions, headers },
 					),
 				);
 			} catch (error) {
 				const errorMessage = createErrorMessage(model, error);
 				stream.push({ type: "start", partial: errorMessage });
 				stream.push({ type: "error", reason: "error", error: errorMessage });
+			} finally {
+				releaseRelay?.();
 			}
 		})();
 
+		// SAFETY: the deferred wrapper implements the async-iterable and result()
+		// surface expected by Pi's AssistantMessageEventStream.
 		return stream as unknown as AssistantMessageEventStream;
 	};
 }
@@ -588,6 +839,41 @@ let _apiProviderRegistrationSourceId: string | undefined;
 let _apiProviderRegistrationPromise: Promise<void> | undefined;
 
 /**
+ * Pick the stream for a compat-registry call. The registry key is the api id
+ * (`opencode-dynamic`), so `opencode-free` and `opencode-go` share one entry:
+ * free models must use the anonymous bearer, Go keeps the credential.
+ *
+ * Exported so the rule is unit-tested directly.
+ */
+export function selectOpenCodeCompatStream<T>(
+	freeStream: T,
+	keyedStream: T,
+	providerId: string | undefined,
+): T {
+	return providerId === PROVIDER_OPENCODE_FREE ? freeStream : keyedStream;
+}
+
+/**
+ * Stream for the compat registry: one anonymous instance and one keyed
+ * instance, dispatched per model. `createStream` is injectable so a test can
+ * assert both construction flags without a network or host import.
+ */
+export function createOpenCodeCompatStream(
+	tracker: OpenCodeSessionTracker,
+	createStream: typeof createOpenCodeStreamSimple = createOpenCodeStreamSimple,
+	getModelApi?: (model: Model<Api>) => Api | undefined,
+): NonNullable<ProviderConfig["streamSimple"]> {
+	const freeStream = createStream(tracker, { anonymous: true });
+	const keyedStream = createStream(tracker);
+	return (model, context, options) =>
+		selectOpenCodeCompatStream(freeStream, keyedStream, model.provider)(
+			{ ...model, api: getModelApi?.(model) ?? model.api },
+			context,
+			options,
+		);
+}
+
+/**
  * Register the opencode-dynamic API in compat's global API registry
  * so that fallback code paths (compat streamSimple) can resolve it.
  * Safe to call multiple times — registers once per tracker instance.
@@ -598,26 +884,37 @@ let _apiProviderRegistrationPromise: Promise<void> | undefined;
  */
 export function ensureOpenCodeApiProviderRegistered(
 	tracker: OpenCodeSessionTracker,
+	getModelApi?: (model: Model<Api>) => Api | undefined,
 ): void {
-	if (_apiProviderRegistrationSourceId || _apiProviderRegistrationPromise) return;
+	if (_apiProviderRegistrationSourceId || _apiProviderRegistrationPromise)
+		return;
 
-	const streamFn = createOpenCodeStreamSimple(tracker);
+	const streamFn = createOpenCodeCompatStream(
+		tracker,
+		createOpenCodeStreamSimple,
+		getModelApi,
+	);
 	const sourceId = `pi-free-opencode-${randomBytes(4).toString("hex")}`;
-	_apiProviderRegistrationPromise = import("@earendil-works/pi-ai/compat")
+	_apiProviderRegistrationPromise = loadPiAiEntry<{
+		registerApiProvider?: unknown;
+	}>("compat")
 		.then(({ registerApiProvider }) => {
+			// The vendored last-resort bundle does not carry registerApiProvider:
+			// the registry lives in the HOST's compat instance (provider-composer
+			// reads it), so a vendored registration would be a silent no-op.
+			// Primary dispatch does not need it — the provider config carries
+			// streamSimple, which provider-composer prefers over the registry.
+			if (typeof registerApiProvider !== "function") return;
 			// registerApiProvider expects { api, stream, streamSimple }. Both
 			// stream and streamSimple return async-iterable streams; using the
 			// same implementation for both is safe — the compat wrappers only
 			// validate model.api and forward the call.
-			const opencodeStreamFn = streamFn as StreamFunction<
-				"opencode-dynamic",
-				SimpleStreamOptions
-			>;
-			registerApiProvider(
+			// eslint-disable-next-line @typescript-eslint/no-explicit-any
+			(registerApiProvider as any)(
 				{
 					api: OPENCODE_DYNAMIC_API,
-					stream: opencodeStreamFn,
-					streamSimple: opencodeStreamFn,
+					stream: streamFn as any,
+					streamSimple: streamFn,
 				},
 				sourceId,
 			);
@@ -641,7 +938,7 @@ export function ensureOpenCodeApiProviderRegistered(
  *
  * This sanitizer fixes all three issues with minimal placeholder messages.
  */
-export function sanitizeMessagesForOpenCode(messages: unknown[]): unknown[] {
+function sanitizeMessagesForOpenCode(messages: unknown[]): unknown[] {
 	if (!Array.isArray(messages)) return messages;
 
 	const sanitized: unknown[] = [];

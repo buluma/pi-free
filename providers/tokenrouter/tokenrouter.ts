@@ -10,49 +10,71 @@
  * Setup:
  *   TOKENROUTER_API_KEY=sk-...
  *   # or add tokenrouter_api_key to ~/.pi/free.json
+ *
+ * Wire protocol: TokenRouter speaks vanilla OpenAI Chat Completions, so this
+ * is a standard OpenAI-compatible native provider registered through the
+ * shared `registerNativeOpenAIProvider()` path (like Cline and B.AI) — the
+ * models use the standard `"openai-completions"` api and stream through
+ * pi-ai's native implementation via the lazy compat bridge. No custom API
+ * type, no custom stream wrappers: request shaping happens in a single
+ * `before_provider_request` normalizer, response cleanup in `message_end`.
+ *
+ * TokenRouter-specific behaviors are thin seams on the standard provider:
+ *  - Request normalization (`before_provider_request`): every request gets
+ *    `reasoning_split: true` (clean `reasoning_content` separation; ignored
+ *    by upstreams that do not support it), MiniMax-M3's `thinking` object is
+ *    rewritten from pi's `{ type: "enabled" }` to the required
+ *    `{ type: "adaptive" }`, and top-level `reasoning_effort` values outside
+ *    the gateway's accepted set are mapped or dropped (the route rejects
+ *    anything but low/medium/xhigh with
+ *    `400: reasoning_effort must be low, medium, or xhigh`).
+ *  - Model compat: the shared `getProxyModelCompat` (same as Cline/B.AI, so
+ *    `requiresReasoningContentOnAssistantMessages` keeps replaying
+ *    `reasoning_content` across turns) with `supportsReasoningEffort`
+ *    explicitly disabled — the strip is re-applied after models.dev
+ *    enrichment so the flag can never be re-derived.
+ *  - MiniMax-M3 (`message_end`): sometimes emits DeepSeek-style inline
+ *    `<think> … </think>` reasoning tags in the assistant text; they are
+ *    extracted into proper ThinkingContent blocks.
  */
 
 import type {
 	ExtensionAPI,
 	ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent";
-import {
-	openAICompletionsApi,
-	type Api,
-	type AssistantMessage,
-	type AssistantMessageEvent,
-	type AssistantMessageEventStream,
-	type Context,
-	type Model,
-	type SimpleStreamOptions,
-	type ThinkingContent,
+import type {
+	AssistantMessage,
+	ThinkingContent,
 } from "@earendil-works/pi-ai/compat";
-import { createAssistantMessageEventStream } from "../../lib/assistant-message-event-stream.ts";
-import { applyHidden } from "../../config.ts";
+import {
+	getTokenrouterApiKey,
+	getTokenrouterShowPaid,
+	applyHidden,
+} from "../../config.ts";
 import {
 	BASE_URL_TOKENROUTER,
 	DEFAULT_FETCH_TIMEOUT_MS,
 	PROVIDER_TOKENROUTER,
 } from "../../constants.ts";
+import { isChatModelConfig, type ChatModelConfig } from "../../lib/types.ts";
 import { createLogger } from "../../lib/logger.ts";
 import { safeEnrichModelsWithModelsDev } from "../../lib/model-metadata.ts";
 import {
-	DEEPSEEK_PROXY_COMPAT,
+	createNativeOpenAIProvider,
+	registerNativeOpenAIProvider,
+	type NativeOpenAIProviderOptions,
+} from "../../lib/native-provider.ts";
+import {
 	getProxyModelCompat,
 	isLikelyReasoningModel,
 } from "../../lib/provider-compat.ts";
-import { cleanModelName, fetchWithRetry } from "../../lib/util.ts";
-import {
-	createTokenRouterProvider as createNativeTokenRouterProvider,
-	registerTokenRouterProvider,
-	type TokenRouterProviderDeps,
-} from "./tokenrouter-provider.ts";
+import { cleanModelName, fetchWithRetry, withSignal } from "../../lib/util.ts";
+import { tokenRouterAuth } from "./tokenrouter-auth.ts";
 
 const _logger = createLogger("tokenrouter");
-const streamSimpleOpenAICompletions = openAICompletionsApi().streamSimple;
 
 // =============================================================================
-// Reasoning cleanup
+// MiniMax reasoning cleanup
 // TokenRouter's MiniMax-M3 model sometimes emits DeepSeek-style `<think>`
 // reasoning tags inline in the assistant text. Pi does not strip them, so we
 // extract them into proper ThinkingContent blocks on message_end.
@@ -71,9 +93,11 @@ function collapseWhitespace(text: string): string {
 		.trim();
 }
 
-function extractThinkBlocks(text: string): ExtractedThinking {
-	const openTag = "<think>";
-	const closeTag = "</think>";
+function extractTaggedBlocks(
+	text: string,
+	openTag: string,
+	closeTag: string,
+): ExtractedThinking {
 	const thinkingParts: string[] = [];
 	const textParts: string[] = [];
 	let cursor = 0;
@@ -98,27 +122,230 @@ function extractThinkBlocks(text: string): ExtractedThinking {
 		cursor = closeStart + closeTag.length;
 	}
 
+	return { text: textParts.join(""), thinking: thinkingParts.join("\n\n") };
+}
+
+function extractThinkBlocks(text: string): ExtractedThinking {
+	// Primary: real <think>…</think> tags. Fallback: the space-prefixed
+	// " thinking … response" variants some MiniMax upstreams emit when the
+	// angle brackets are stripped.
+	let result = extractTaggedBlocks(text, "<think>", "</think>");
+	if (!result.thinking) {
+		result = extractTaggedBlocks(text, " thinking", " response");
+	}
 	return {
-		text: collapseWhitespace(textParts.join("")),
-		thinking: collapseWhitespace(thinkingParts.join("\n\n")),
+		text: collapseWhitespace(result.text),
+		thinking: collapseWhitespace(result.thinking),
 	};
 }
 
-export function isTokenRouterModel(model: { provider?: string }): boolean {
-	return model.provider === PROVIDER_TOKENROUTER;
+export function isTokenRouterMinimaxModel(modelId: string): boolean {
+	return modelId.toLowerCase().includes("minimax");
+}
+
+export function normalizeAssistantMessage(
+	message: AssistantMessage,
+): AssistantMessage {
+	const newContent: AssistantMessage["content"] = [];
+	let extractedThinking = "";
+
+	for (const block of message.content) {
+		if (block.type !== "text") {
+			newContent.push(block);
+			continue;
+		}
+
+		const extracted = extractThinkBlocks(block.text);
+		if (extracted.thinking) {
+			extractedThinking = extractedThinking
+				? `${extractedThinking}\n\n${extracted.thinking}`
+				: extracted.thinking;
+		}
+		if (extracted.text) {
+			newContent.push({ ...block, text: extracted.text });
+		}
+	}
+
+	if (extractedThinking) {
+		newContent.push({
+			type: "thinking",
+			thinking: extractedThinking,
+		} as ThinkingContent);
+	}
+
+	return { ...message, content: newContent };
 }
 
 // =============================================================================
-// Known Free Models
-// TokenRouter doesn't expose pricing via /v1/models.
-// Known-free detection uses `:free` name suffix for promotional models.
+// Request normalization (single before_provider_request seam)
+// Encodes every TokenRouter wire quirk at one boundary so no custom stream
+// wrapper or per-model compat patching is needed:
+//   1. `reasoning_split: true` — always requested for clean reasoning/content
+//      separation (upstreams without support ignore it).
+//   2. MiniMax-M3 requires `thinking: { type: "adaptive" }`; pi sends
+//      `{ type: "enabled" }`, which is rewritten.
+//   3. `reasoning_effort` must be low/medium/xhigh. pi-ai derives values from
+//      models.dev thinkingLevelMaps that contain entries like "none", which
+//      the gateway rejects with a 400 — invalid values are dropped and
+//      near-misses are mapped onto the accepted set.
 // =============================================================================
-export const TOKENROUTER_OPENAI_API = "tokenrouter-openai-completions" as const;
-const TOKENROUTER_HIGH_LOAD_RETRY_DELAY_MS = 30_000;
-const MINIMAX_ADAPTIVE_COMPAT: NonNullable<ProviderModelConfig["compat"]> = {
-	...DEEPSEEK_PROXY_COMPAT,
-	thinkingFormat: "deepseek",
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function containsTokenRouterMinimaxModel(value: unknown): boolean {
+	if (Array.isArray(value)) {
+		return value.some(containsTokenRouterMinimaxModel);
+	}
+	if (!isRecord(value)) return false;
+
+	for (const [key, child] of Object.entries(value)) {
+		if (key === "model" && isTokenRouterMinimaxModel(String(child ?? ""))) {
+			return true;
+		}
+		if (containsTokenRouterMinimaxModel(child)) return true;
+	}
+	return false;
+}
+
+/** OpenAI-role system prompt that some upstreams reject (see normalizer). */
+function isDeveloperMessage(message: unknown): boolean {
+	return isRecord(message) && message.role === "developer";
+}
+
+/** reasoning_effort values the TokenRouter chat-completions route accepts. */
+const VALID_REASONING_EFFORTS = new Set(["low", "medium", "xhigh"]);
+
+/** Near-miss effort names mapped onto the gateway's accepted set. */
+const REASONING_EFFORT_ALIASES: Record<string, string> = {
+	minimal: "low",
+	high: "xhigh",
 };
+
+function sanitizeReasoningEffort(
+	payload: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+	if (!("reasoning_effort" in payload)) return undefined;
+	const raw = payload.reasoning_effort;
+	if (typeof raw === "string") {
+		const lowered = raw.toLowerCase();
+		if (VALID_REASONING_EFFORTS.has(lowered)) {
+			return lowered === raw
+				? undefined
+				: { ...payload, reasoning_effort: lowered };
+		}
+		const aliased = REASONING_EFFORT_ALIASES[lowered];
+		if (aliased) return { ...payload, reasoning_effort: aliased };
+	}
+	// Present but invalid (null, "none", non-strings): drop the field —
+	// sending it would hard-fail the whole request with a 400.
+	const { reasoning_effort: _dropped, ...rest } = payload;
+	return rest;
+}
+
+/**
+ * Chat-completions request payload at the TokenRouter wire boundary: raw JSON
+ * text or an already-structured JSON value.
+ */
+type TokenRouterRequestPayload =
+	| string
+	| number
+	| boolean
+	| null
+	| TokenRouterRequestPayload[]
+	| { [key: string]: unknown };
+
+export function normalizeTokenRouterRequestPayload(
+	payload: unknown,
+	force = false,
+): TokenRouterRequestPayload {
+	if (typeof payload === "string") {
+		try {
+			const parsed = JSON.parse(payload) as unknown;
+			const normalized = normalizeTokenRouterRequestPayload(parsed, force);
+			return normalized === parsed ? payload : JSON.stringify(normalized);
+		} catch {
+			return payload;
+		}
+	}
+	if (!isRecord(payload)) return payload as TokenRouterRequestPayload;
+
+	let next: Record<string, unknown> = payload;
+	let changed = false;
+
+	// Always request split reasoning for clean thinking display.
+	if (next.reasoning_split !== true) {
+		next = { ...next, reasoning_split: true };
+		changed = true;
+	}
+
+	// Rewrite OpenAI "developer" role messages to "system": pi-ai defaults
+	// unknown providers to the developer role, but TokenRouter forwards it to
+	// upstreams (e.g. Qwen) that reject it with
+	// `422 openai_error / bad_response_status_code`.
+	if (Array.isArray(next.messages) && next.messages.some(isDeveloperMessage)) {
+		next = {
+			...next,
+			messages: (next.messages as unknown[]).map((message) =>
+				isRecord(message) && message.role === "developer"
+					? { ...message, role: "system" }
+					: message,
+			),
+		};
+		changed = true;
+	}
+
+	// MiniMax-M3 only: rewrite pi's thinking "enabled" to "adaptive".
+	if (
+		(force || containsTokenRouterMinimaxModel(next)) &&
+		isRecord(next.thinking) &&
+		next.thinking.type === "enabled"
+	) {
+		next = { ...next, thinking: { ...next.thinking, type: "adaptive" } };
+		changed = true;
+	}
+
+	// Clamp reasoning_effort to the gateway's accepted set.
+	const sanitized = sanitizeReasoningEffort(next);
+	if (sanitized) {
+		next = sanitized;
+		changed = true;
+	}
+
+	return changed ? next : payload;
+}
+
+// =============================================================================
+// Compat
+// The shared proxy compat (Cline/B.AI parity) is kept for its other flags —
+// most importantly `requiresReasoningContentOnAssistantMessages`, which
+// replays `reasoning_content` on later assistant turns for multi-turn
+// reasoning — with only `supportsReasoningEffort` disabled.
+// =============================================================================
+
+export function withoutReasoningEffort(
+	compat: ChatModelConfig["compat"],
+): ChatModelConfig["compat"] {
+	if (!compat || !("supportsReasoningEffort" in compat)) return compat;
+	return { ...compat, supportsReasoningEffort: false };
+}
+
+/**
+ * Re-apply the reasoning-effort strip after models.dev enrichment. Enrichment
+ * re-derives proxy compat from models.dev metadata and would otherwise
+ * re-inject `supportsReasoningEffort` on models that carried no base compat.
+ */
+export function stripEnrichedTokenRouterCompat<T extends ProviderModelConfig>(
+	models: readonly T[],
+): T[] {
+	return models.map((model) => {
+		// Chat-only strip: image/classifier entries pass through (pi 1.x union).
+		if (!isChatModelConfig(model)) return model;
+		const compat = withoutReasoningEffort(model.compat);
+		return compat === model.compat ? model : { ...model, compat };
+	});
+}
 
 // =============================================================================
 // Types
@@ -159,324 +386,17 @@ function isTextChatModel(model: TokenRouterModel): boolean {
 	return model.supported_endpoint_types.some((t) => CHAT_ENDPOINT_TYPES.has(t));
 }
 
-export function isTokenRouterMinimaxModel(modelId: string): boolean {
-	return modelId.toLowerCase().includes("minimax");
-}
-
-export function finalizeTokenRouterModel(
-	model: ProviderModelConfig,
-): ProviderModelConfig {
-	if (!isTokenRouterMinimaxModel(model.id)) return model;
-
-	return {
-		...model,
-		reasoning: true,
-		compat: {
-			...MINIMAX_ADAPTIVE_COMPAT,
-			...(model.compat ?? {}),
-			thinkingFormat: "deepseek",
-			supportsReasoningEffort: true,
-		},
-	};
-}
-
-export function normalizeAssistantMessage(
-	message: AssistantMessage,
-): AssistantMessage {
-	const newContent: AssistantMessage["content"] = [];
-	let extractedThinking = "";
-
-	for (const block of message.content) {
-		if (block.type !== "text") {
-			newContent.push(block);
-			continue;
-		}
-
-		const extracted = extractThinkBlocks(block.text);
-		if (extracted.thinking) {
-			extractedThinking = extractedThinking
-				? `${extractedThinking}\n\n${extracted.thinking}`
-				: extracted.thinking;
-		}
-		if (extracted.text) {
-			newContent.push({ ...block, text: extracted.text });
-		}
-	}
-
-	if (extractedThinking) {
-		newContent.push({
-			type: "thinking",
-			thinking: extractedThinking,
-		} as ThinkingContent);
-	}
-
-	return { ...message, content: newContent };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function containsTokenRouterMinimaxModel(value: unknown): boolean {
-	if (Array.isArray(value)) {
-		return value.some(containsTokenRouterMinimaxModel);
-	}
-	if (!isRecord(value)) return false;
-
-	for (const [key, child] of Object.entries(value)) {
-		if (key === "model" && isTokenRouterMinimaxModel(String(child ?? ""))) {
-			return true;
-		}
-		if (containsTokenRouterMinimaxModel(child)) return true;
-	}
-	return false;
-}
-
-function patchThinkingType(value: unknown): {
-	value: unknown;
-	changed: boolean;
-} {
-	if (Array.isArray(value)) {
-		let changed = false;
-		const patched = value.map((child) => {
-			const result = patchThinkingType(child);
-			changed ||= result.changed;
-			return result.value;
-		});
-		return changed ? { value: patched, changed } : { value, changed: false };
-	}
-	if (!isRecord(value)) return { value, changed: false };
-
-	let changed = false;
-	const patched: Record<string, unknown> = {};
-	for (const [key, child] of Object.entries(value)) {
-		let next = patchThinkingType(child).value;
-		if (key === "thinking" && isRecord(next) && next.type === "enabled") {
-			next = { ...next, type: "adaptive" };
-			changed = true;
-		} else {
-			changed ||= next !== child;
-		}
-		patched[key] = next;
-	}
-
-	return changed ? { value: patched, changed } : { value, changed: false };
-}
-
-export function patchTokenRouterMinimaxThinkingPayload(
-	payload: unknown,
-	force = false,
-): unknown {
-	if (typeof payload === "string") {
-		try {
-			const parsed = JSON.parse(payload) as unknown;
-			const patched = patchTokenRouterMinimaxThinkingPayload(parsed, force);
-			return patched === parsed ? payload : JSON.stringify(patched);
-		} catch {
-			return payload;
-		}
-	}
-
-	if (!force && !containsTokenRouterMinimaxModel(payload)) return payload;
-	const result = patchThinkingType(payload);
-	return result.changed ? result.value : payload;
-}
-
-function isTokenRouterHighLoadError(message: string | undefined): boolean {
-	const lower = (message ?? "").toLowerCase();
-	return (
-		lower.includes("(2064)") ||
-		lower.includes("server cluster is currently under high load")
-	);
-}
-
-function isOutputEvent(event: AssistantMessageEvent): boolean {
-	return (
-		event.type === "text_start" ||
-		event.type === "text_delta" ||
-		event.type === "text_end" ||
-		event.type === "thinking_start" ||
-		event.type === "thinking_delta" ||
-		event.type === "thinking_end" ||
-		event.type === "toolcall_start" ||
-		event.type === "toolcall_delta" ||
-		event.type === "toolcall_end"
-	);
-}
-
-function waitForTokenRouterRetry(
-	ms: number,
-	signal: AbortSignal | undefined,
-): Promise<void> {
-	if (signal?.aborted) return Promise.reject(new Error("aborted"));
-	return new Promise((resolve, reject) => {
-		const onAbort = () => {
-			clearTimeout(timeout);
-			reject(new Error("aborted"));
-		};
-		const timeout = setTimeout(() => {
-			signal?.removeEventListener("abort", onAbort);
-			resolve();
-		}, ms);
-		signal?.addEventListener("abort", onAbort, { once: true });
-	});
-}
-
-function createTokenRouterOpenAIStream(
-	model: Model<Api>,
-	context: Context,
-	options: SimpleStreamOptions | undefined,
-): AssistantMessageEventStream {
-	const forcePatch = isTokenRouterMinimaxModel(model.id);
-	return streamSimpleOpenAICompletions(
-		{ ...model, api: "openai-completions" } as Model<"openai-completions">,
-		context,
-		{
-			...options,
-			onPayload: async (payload, payloadModel) => {
-				const patchedPayload = patchTokenRouterMinimaxThinkingPayload(
-					payload,
-					forcePatch,
-				);
-				const upstreamPayload = await options?.onPayload?.(
-					patchedPayload,
-					payloadModel,
-				);
-				return patchTokenRouterMinimaxThinkingPayload(
-					upstreamPayload ?? patchedPayload,
-					forcePatch,
-				);
-			},
-		},
-	);
-}
-
-function createTokenRouterRetryErrorMessage(
-	model: Model<Api>,
-	options: SimpleStreamOptions | undefined,
-	error: unknown,
-): AssistantMessage {
-	return {
-		role: "assistant",
-		content: [],
-		api: model.api,
-		provider: model.provider,
-		model: model.id,
-		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		stopReason: options?.signal?.aborted ? "aborted" : "error",
-		errorMessage: error instanceof Error ? error.message : String(error),
-		timestamp: Date.now(),
-	};
-}
-
-function streamWithTokenRouterHighLoadRetry(
-	model: Model<Api>,
-	createAttempt: () => AssistantMessageEventStream,
-	options: SimpleStreamOptions | undefined,
-): AssistantMessageEventStream {
-	const output = createAssistantMessageEventStream();
-
-	void (async () => {
-		const buffer: AssistantMessageEvent[] = [];
-		let flushed = false;
-		let sawOutput = false;
-
-		function flushBuffer(): void {
-			if (flushed) return;
-			flushed = true;
-			for (const event of buffer) output.push(event);
-			buffer.length = 0;
-		}
-
-		try {
-			const first = createAttempt();
-			let retryAfterHighLoad = false;
-			for await (const event of first) {
-				if (isOutputEvent(event)) {
-					sawOutput = true;
-					flushBuffer();
-					output.push(event);
-					continue;
-				}
-
-				if (
-					event.type === "error" &&
-					!sawOutput &&
-					isTokenRouterHighLoadError(event.error.errorMessage)
-				) {
-					retryAfterHighLoad = true;
-					break;
-				}
-
-				if (flushed) output.push(event);
-				else buffer.push(event);
-			}
-
-			if (!retryAfterHighLoad) {
-				flushBuffer();
-				return;
-			}
-
-			_logger.warn(
-				"[tokenrouter] Server cluster high load (2064); retrying once after 30s",
-			);
-			await waitForTokenRouterRetry(
-				TOKENROUTER_HIGH_LOAD_RETRY_DELAY_MS,
-				options?.signal,
-			);
-			for await (const event of createAttempt()) output.push(event);
-		} catch (error) {
-			flushBuffer();
-			const message = createTokenRouterRetryErrorMessage(model, options, error);
-			output.push({
-				type: "error",
-				reason: message.stopReason as "error" | "aborted",
-				error: message,
-			});
-		}
-	})();
-
-	return output as unknown as AssistantMessageEventStream;
-}
-
-export function streamSimpleTokenRouter(
-	model: Model<Api>,
-	context: Context,
-	options?: SimpleStreamOptions,
-): AssistantMessageEventStream {
-	return streamWithTokenRouterHighLoadRetry(
-		model,
-		() => createTokenRouterOpenAIStream(model, context, options),
-		options,
-	);
-}
-
-export const __test__ = {
-	TOKENROUTER_HIGH_LOAD_RETRY_DELAY_MS,
-	isTokenRouterHighLoadError,
-	streamWithTokenRouterHighLoadRetry,
-	waitForTokenRouterRetry,
-};
-
 export function mapTokenRouterModel(
 	model: TokenRouterModel,
-): ProviderModelConfig & {
+): ChatModelConfig & {
 	_pricingKnown?: boolean;
 	_freeKnown?: boolean;
 	_isFree?: boolean;
 } {
 	const name = cleanModelName(model.id);
-	const isMinimax = isTokenRouterMinimaxModel(model.id);
-	const reasoning = isMinimax || isLikelyReasoningModel({ id: model.id, name });
-	const isResponseApi =
-		model.supported_endpoint_types.includes("openai-response");
+	const reasoning =
+		isTokenRouterMinimaxModel(model.id) ||
+		isLikelyReasoningModel({ id: model.id, name });
 	const isKnownFree = model.id.toLowerCase().endsWith(":free");
 
 	return {
@@ -487,26 +407,21 @@ export function mapTokenRouterModel(
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 		contextWindow: 128_000,
 		maxTokens: 16_384,
-		compat: {
-			...(isMinimax
-				? MINIMAX_ADAPTIVE_COMPAT
-				: getProxyModelCompat({ id: model.id, name })),
-			// openai-response models use a different API shape
-			...(isResponseApi ? { apiType: "openai-response" as const } : {}),
-		},
+		// Shared compat (Cline/B.AI parity) minus `supportsReasoningEffort`.
+		compat: withoutReasoningEffort(getProxyModelCompat({ id: model.id, name })),
 		// Known-free models bypass pricing detection entirely
 		_freeKnown: isKnownFree,
 		_isFree: isKnownFree,
 		// Non-free models signal no pricing data (name-based detection only)
 		_pricingKnown: false,
-	} as ProviderModelConfig & { _pricingKnown?: boolean };
+	} as ChatModelConfig & { _pricingKnown?: boolean };
 }
 
 // =============================================================================
 // Fetch Models
 // =============================================================================
 
-export async function fetchTokenRouterModels(
+async function fetchTokenRouterModels(
 	apiKey: string,
 	signal?: AbortSignal,
 ): Promise<ProviderModelConfig[]> {
@@ -515,14 +430,16 @@ export async function fetchTokenRouterModels(
 	try {
 		const response = await fetchWithRetry(
 			`${BASE_URL_TOKENROUTER}/models`,
-			{
-				headers: {
-					Authorization: `Bearer ${apiKey}`,
-					Accept: "application/json",
-					"Content-Type": "application/json",
+			withSignal(
+				{
+					headers: {
+						Authorization: `Bearer ${apiKey}`,
+						Accept: "application/json",
+						"Content-Type": "application/json",
+					},
 				},
 				signal,
-			},
+			),
 			3,
 			1000,
 			DEFAULT_FETCH_TIMEOUT_MS,
@@ -541,7 +458,7 @@ export async function fetchTokenRouterModels(
 			{ providerId: PROVIDER_TOKENROUTER },
 		);
 		return applyHidden(
-			enriched.map(finalizeTokenRouterModel),
+			stripEnrichedTokenRouterCompat(enriched),
 			PROVIDER_TOKENROUTER,
 		);
 	} catch (error) {
@@ -556,24 +473,52 @@ export async function fetchTokenRouterModels(
 	}
 }
 
-const TOKENROUTER_PROVIDER_DEPS: TokenRouterProviderDeps = {
-	fetchModels: fetchTokenRouterModels,
-	streamSimple: streamSimpleTokenRouter,
-	isModel: isTokenRouterModel,
-	isMinimaxModel: isTokenRouterMinimaxModel,
-	normalizeMessage: normalizeAssistantMessage,
-	patchPayload: patchTokenRouterMinimaxThinkingPayload,
-};
+// =============================================================================
+// Native Provider
+// =============================================================================
 
 export function createTokenRouterProvider(
 	initialModels?: ProviderModelConfig[],
 ) {
-	return initialModels === undefined
-		? createNativeTokenRouterProvider(TOKENROUTER_PROVIDER_DEPS)
-		: createNativeTokenRouterProvider(TOKENROUTER_PROVIDER_DEPS, initialModels);
+	const options: NativeOpenAIProviderOptions = {
+		providerId: PROVIDER_TOKENROUTER,
+		name: "TokenRouter",
+		baseUrl: BASE_URL_TOKENROUTER,
+		auth: tokenRouterAuth,
+		getApiKey: getTokenrouterApiKey,
+		getShowPaid: getTokenrouterShowPaid,
+		fetchModels: (apiKey, signal) => fetchTokenRouterModels(apiKey, signal),
+	};
+	if (initialModels) options.initialModels = initialModels;
+	return createNativeOpenAIProvider(options);
 }
 
 export default function tokenRouterProvider(pi: ExtensionAPI): Promise<void> {
-	registerTokenRouterProvider(pi, TOKENROUTER_PROVIDER_DEPS);
+	registerNativeOpenAIProvider(pi, {
+		providerId: PROVIDER_TOKENROUTER,
+		name: "TokenRouter",
+		baseUrl: BASE_URL_TOKENROUTER,
+		auth: tokenRouterAuth,
+		getApiKey: getTokenrouterApiKey,
+		getShowPaid: getTokenrouterShowPaid,
+		fetchModels: (apiKey, signal) => fetchTokenRouterModels(apiKey, signal),
+	});
+
+	// Normalize every outgoing TokenRouter payload at the wire boundary. The
+	// handler's RETURN value replaces the payload in the runner (a hook that
+	// only patches in place is a silent no-op).
+	pi.on("before_provider_request", (event, ctx) => {
+		if (ctx.model?.provider !== PROVIDER_TOKENROUTER) return;
+		const force = isTokenRouterMinimaxModel(ctx.model?.id ?? "");
+		return normalizeTokenRouterRequestPayload(event.payload, force);
+	});
+
+	// Extract MiniMax inline `<think> … </think>` tags into thinking blocks.
+	pi.on("message_end", (event, ctx) => {
+		if (ctx.model?.provider !== PROVIDER_TOKENROUTER) return;
+		if (event.message.role !== "assistant") return;
+		return { message: normalizeAssistantMessage(event.message) };
+	});
+
 	return Promise.resolve();
 }

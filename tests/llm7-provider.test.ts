@@ -18,6 +18,10 @@ import type {
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockGetLlm7ShowPaid = vi.hoisted(() => vi.fn(() => false));
+const mockGetModelViewOverride = vi.hoisted(() =>
+	vi.fn((_providerId: string): "free" | "all" | undefined => undefined),
+);
+const mockSetModelViewOverride = vi.hoisted(() => vi.fn());
 const mockGetLlm7ApiKey = vi.hoisted(() =>
 	vi.fn((): string | undefined => undefined),
 );
@@ -30,12 +34,20 @@ const mockFetch = vi.hoisted(() => vi.fn());
 vi.mock("../config.ts", () => ({
 	getLlm7ApiKey: () => mockGetLlm7ApiKey(),
 	getLlm7ShowPaid: () => mockGetLlm7ShowPaid(),
+	getModelViewOverride: (providerId: string) =>
+		mockGetModelViewOverride(providerId),
+	setModelViewOverride: (...args: unknown[]) =>
+		mockSetModelViewOverride(...args),
 	applyHidden: (models: { id: string }[]) => mockApplyHidden(models),
 }));
 
 vi.mock("../lib/registry.ts", () => ({
 	getGlobalFreeOnly: () => mockGetGlobalFreeOnly(),
-	getGlobalFreeOnlyForced: () => false,
+	// Mirrors the real resolveModelView over the mocked config getters (the
+	// real rule is unit-tested in registry-provider-overrides.test.ts).
+	resolveModelView: (providerId: string) =>
+		mockGetModelViewOverride(providerId) ??
+		(mockGetLlm7ShowPaid() ? "all" : mockGetGlobalFreeOnly() ? "free" : "all"),
 	isFreeModel: (m: { cost?: { input?: number } }) => (m.cost?.input ?? 0) === 0,
 }));
 
@@ -131,6 +143,7 @@ function ctx(over: Partial<RefreshModelsContext> = {}): RefreshModelsContext {
 beforeEach(() => {
 	vi.clearAllMocks();
 	mockGetLlm7ShowPaid.mockReturnValue(false);
+	mockGetModelViewOverride.mockReturnValue(undefined);
 	mockGetLlm7ApiKey.mockReturnValue(undefined);
 	mockApplyHidden.mockImplementation(
 		<T extends { id: string }>(models: T[]) => models,
@@ -159,8 +172,14 @@ describe("createLlm7Provider shape", () => {
 		// Native auth: apiKey only — LLM7 has no OAuth flow.
 		expect(provider.auth.apiKey).toBeDefined();
 		expect(provider.auth.oauth).toBeUndefined();
-		// Empty before the first refresh (dynamic provider contract).
-		expect(provider.getModels()).toEqual([]);
+		// Seeded with the static selector catalog at assembly, so models are
+		// visible before the first refresh completes (fresh installs have an
+		// empty store and refresh publication can be superseded).
+		expect(provider.getModels().map((m: { id: string }) => m.id)).toEqual([
+			"default",
+			"fast",
+			"pro",
+		]);
 	});
 });
 
@@ -273,11 +292,17 @@ describe("refreshModels offline init", () => {
 		).toEqual(["default", "fast"]);
 	});
 
-	it("stays empty when the store is empty and network is disallowed", async () => {
+	it("retains the seeded static catalog when the store is empty and network is disallowed", async () => {
 		const { provider } = createLlm7Provider();
 		await provider.refreshModels?.(ctx({ allowNetwork: false }));
 		expect(mockFetch).not.toHaveBeenCalled();
-		expect(provider.getModels()).toEqual([]);
+		// An empty restore must not wipe the assembly seed (restore only
+		// applies non-empty restores).
+		expect(provider.getModels().map((m: { id: string }) => m.id)).toEqual([
+			"default",
+			"fast",
+			"pro",
+		]);
 	});
 
 	it("ignores stored models from other providers", async () => {
@@ -287,7 +312,12 @@ describe("refreshModels offline init", () => {
 		const { store } = makeStore(seeded);
 		const { provider } = createLlm7Provider();
 		await provider.refreshModels?.(ctx({ store, allowNetwork: false }));
-		expect(provider.getModels()).toEqual([]);
+		// Foreign models are filtered on restore; the assembly seed stands.
+		expect(provider.getModels().map((m: { id: string }) => m.id)).toEqual([
+			"default",
+			"fast",
+			"pro",
+		]);
 	});
 
 	it("survives a failing store read without throwing", async () => {
@@ -302,7 +332,12 @@ describe("refreshModels offline init", () => {
 		await expect(
 			provider.refreshModels?.(ctx({ store, allowNetwork: false })),
 		).resolves.toBeUndefined();
-		expect(provider.getModels()).toEqual([]);
+		// A failed read must not wipe the assembly seed either.
+		expect(provider.getModels().map((m: { id: string }) => m.id)).toEqual([
+			"default",
+			"fast",
+			"pro",
+		]);
 	});
 });
 
@@ -312,6 +347,9 @@ describe("refreshModels offline init", () => {
 
 describe("refreshModels online", () => {
 	it("publishes the static selector catalog and persists it, with zero network", async () => {
+		// All-view: pins persist mechanics, not view filtering.
+		mockGetModelViewOverride.mockReturnValue("all");
+
 		const { store, written } = makeStore();
 		const { provider, stored } = createLlm7Provider();
 
@@ -321,24 +359,26 @@ describe("refreshModels online", () => {
 		expect(mockFetch).not.toHaveBeenCalled();
 		// Store persisted exactly once with the full catalog.
 		expect(written).toHaveLength(1);
-		expect(written[0].models.map((m) => m.id)).toEqual([
+		expect(written[0]!.models.map((m) => m.id)).toEqual([
 			"default",
 			"fast",
 			"pro",
 		]);
-		expect(typeof written[0].checkedAt).toBe("number");
+		expect(typeof written[0]!.checkedAt).toBe("number");
 		// Persisted models carry the native wire api + provider + baseUrl.
-		expect(written[0].models.every((m) => m.api === "openai-completions")).toBe(
-			true,
-		);
-		expect(written[0].models.every((m) => m.provider === "llm7")).toBe(true);
 		expect(
-			written[0].models.every((m) => m.baseUrl === "https://api.llm7.io/v1"),
+			written[0]!.models.every((m) => m.api === "openai-completions"),
+		).toBe(true);
+		expect(written[0]!.models.every((m) => m.provider === "llm7")).toBe(true);
+		expect(
+			written[0]!.models.every((m) => m.baseUrl === "https://api.llm7.io/v1"),
 		).toBe(true);
 		// Catalogs populated for the toggle.
 		expect(stored.all.map((m) => m.id)).toEqual(["default", "fast", "pro"]);
 		expect(stored.free.map((m) => m.id)).toEqual(["default", "fast"]);
-		// getModels exposes the complete catalog; Pi applies filterModels.
+		// getModels exposes the complete catalog; Pi applies filterModels
+		// under the free view resolved live below.
+		mockGetModelViewOverride.mockReturnValue(undefined);
 		expect(provider.getModels().map((m) => m.id)).toEqual([
 			"default",
 			"fast",
@@ -375,7 +415,12 @@ describe("refreshModels online", () => {
 			ctx({ store, allowNetwork: true, signal: controller.signal }),
 		);
 
-		expect(provider.getModels()).toEqual([]);
+		// Aborted before any phase ran: the seed stands, nothing persisted.
+		expect(provider.getModels().map((m: { id: string }) => m.id)).toEqual([
+			"default",
+			"fast",
+			"pro",
+		]);
 		expect(written).toHaveLength(0);
 	});
 
@@ -399,54 +444,7 @@ describe("refreshModels online", () => {
 		]);
 	});
 });
-
-// ---------------------------------------------------------------------------
-// Toggle interop (filterModels)
-// ---------------------------------------------------------------------------
-
-describe("toggle interop", () => {
-	async function seededProvider() {
-		const { store } = makeStore();
-		const handle = createLlm7Provider();
-		await handle.provider.refreshModels?.(ctx({ store, allowNetwork: true }));
-		return handle;
-	}
-
-	it("keeps the full catalog while filterModels selects the free view", async () => {
-		const { provider } = await seededProvider();
-		expect(provider.getModels().map((m) => m.id)).toEqual([
-			"default",
-			"fast",
-			"pro",
-		]);
-		expect(
-			provider.filterModels!(provider.getModels(), undefined).map((m) => m.id),
-		).toEqual(["default", "fast"]);
-
-		expect(provider.getModels().map((m) => m.id)).toEqual([
-			"default",
-			"fast",
-			"pro",
-		]);
-		expect(
-			provider.filterModels!(provider.getModels(), undefined).map((m) => m.id),
-		).toEqual(["default", "fast"]);
-	});
-
-	it("decideView shows all when per-provider show_paid is set under global free-only", async () => {
-		mockGetLlm7ShowPaid.mockReturnValue(true);
-		const { provider } = await seededProvider();
-		// show_paid true + global free-only true => filterModels returns all.
-		expect(
-			provider.filterModels!(provider.getModels(), undefined).map((m) => m.id),
-		).toEqual(["default", "fast", "pro"]);
-	});
-
-	it("decideView shows all when global free-only is off", async () => {
-		mockGetGlobalFreeOnly.mockReturnValue(false);
-		const { provider } = await seededProvider();
-		expect(
-			provider.filterModels!(provider.getModels(), undefined).map((m) => m.id),
-		).toEqual(["default", "fast", "pro"]);
-	});
-});
+// NOTE (RPC migration): filter-view behavior is proven live by
+// rpc-session-check (/toggle-llm7 phases incl. persistence across
+// replacement). View resolution itself is pinned in
+// registry-provider-overrides.test.ts against the real resolver.

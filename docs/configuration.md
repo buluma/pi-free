@@ -14,7 +14,6 @@ These are the pi-free config keys and their environment variables:
 | `cline_api_key` | `CLINE_API_KEY` |
 | `ollama_api_key` | `OLLAMA_API_KEY` |
 | `zenmux_api_key` | `ZENMUX_API_KEY` |
-| `crofai_api_key` | `CROFAI_API_KEY` |
 | `llm7_api_key` | `LLM7_API_KEY` |
 | `deepinfra_api_key` | `DEEPINFRA_TOKEN` |
 | `sambanova_api_key` | `SAMBANOVA_API_KEY` |
@@ -26,7 +25,13 @@ These are the pi-free config keys and their environment variables:
 | `anyapi_api_key` | `ANYAPI_API_KEY` |
 | `bai_api_key` | `BAI_API_KEY` |
 | `stepfun_api_key` | `STEPFUN_API_KEY` |
-| `openmodel_api_key` | `OPENMODEL_API_KEY` |
+| `requesty_api_key` | `REQUESTY_API_KEY` |
+| `gmi_api_key` | `GMI_API_KEY` |
+| `agnes_api_key` | `AGNES_API_KEY` |
+| `venice_api_key` | `VENICE_API_KEY` |
+| `infron_api_key` | `INFRON_API_KEY` |
+| `merge_api_key` | `MERGE_API_KEY` |
+| `commandcode_api_key` | `COMMAND_CODE_API_KEY` |
 
 ```bash
 export FASTROUTER_API_KEY="..."
@@ -41,8 +46,11 @@ Example file:
   "cline_api_key": "...",
   "ollama_api_key": "...",
   "anyapi_api_key": "...",
-  "stepfun_api_key": "...",
-  "openmodel_api_key": "..."
+  "stepfun_api_key": "..."
+  "venice_api_key": "...",
+  "infron_api_key": "...",
+  "merge_api_key": "...",
+  "commandcode_api_key": "..."
 }
 ```
 
@@ -55,13 +63,12 @@ NVIDIA, Together, Mistral, Groq, Cerebras, xAI, and Hugging Face are Pi-built-in
 ```json
 {
   "free_only": true,
-  "kilo_show_paid": true,
-  "stepfun_show_paid": true,
-  "qoder_show_paid": false
+  "model_view_overrides": { "kilo": "all" },
+  "stepfun_show_paid": true
 }
 ```
 
-`free_only` controls the global filter. Each provider's `<provider>_show_paid` value controls its provider toggle. StepFun defaults to showing its paid catalog because the Step Plan catalog has no free models; set `stepfun_show_paid` or `STEPFUN_SHOW_PAID=false` to hide it. Environment flags use the uppercase form, for example `PI_FREE_ONLY`, `KILO_SHOW_PAID`, and `QODER_SHOW_PAID`. The legacy `kilo_free_only` setting is also supported as `PI_FREE_KILO_FREE_ONLY`.
+`free_only` controls the global filter. An explicit per-provider choice wins over the global default, otherwise the provider follows it; `/toggle-free` flips the global flag and clears all per-provider choices so the new default applies uniformly. Explicit choices live in `model_view_overrides` (written by `/toggle-<provider>`, never by hand) — a legacy `<provider>_show_paid: true` still counts as an explicit "show all" for upgrades, but `false` values are template defaults and no longer meaningful on their own. StepFun defaults to showing its paid catalog because the Step Plan catalog has no free models; hide it with `/toggle-stepfun`, `"model_view_overrides": {"stepfun": "free"}`, or `STEPFUN_SHOW_PAID=false`. Environment flags use the uppercase form, for example `PI_FREE_ONLY`, `KILO_SHOW_PAID`, and `QODER_SHOW_PAID`. The legacy `kilo_free_only` setting is also supported as `PI_FREE_KILO_FREE_ONLY`.
 
 ### Hidden models
 
@@ -130,13 +137,15 @@ PI_FREE_TELEMETRY_FILE=/tmp/free-telemetry.json
 
 The telemetry file defaults to `~/.pi/free-telemetry.json`. `free.log` rotates asynchronously at the configured size (10 MiB by default) and keeps three backups (`free.log.1` through `.3`). Rotation and the initial log-file check are lazy and do not block extension startup. `PI_FREE_LOG_PATH` accepts a filename within `~/.pi`; it does not accept an arbitrary directory path.
 
+The telemetry file carries a second, additive section: `diagnostics.piAi`, one record per session, holding what the install resolved — the bare-specifier pi-ai copy (`fastPathRoot`/`fastPathVersion`), its per-entry export coverage, the entry-aware resolution per allow-listed entry, whether `dist/vendor` is present, and the session's fast-path failures with how each recovered. It is written at `session_start` and refreshed by `/pi-free-health`, flushed immediately (Pi calls `process.exit(0)` right after startup, so a debounced write would be lost). Files written before this section existed simply lack the key; their model data still parses. `/clear-free-telemetry` removes it with everything else.
+
 ## File locations
 
 | File | Purpose |
 | --- | --- |
 | `~/.pi/free.json` | pi-free config, flags, and extension-provider keys |
 | `~/.pi/free.log` and `.1`–`.3` | Rotating extension log (includes opt-in `benchmark-lookup` diagnostics) |
-| `~/.pi/free-telemetry.json` | Local model performance telemetry |
+| `~/.pi/free-telemetry.json` | Local model performance telemetry, plus one pi-ai resolution diagnostics record per session |
 | `~/.pi/provider-cache.json` | Legacy cache and Ollama compatibility data |
 | `~/.pi/agent/models-store.json` | Pi native provider catalogs |
 | `~/.pi/agent/auth.json` | Pi native credentials and Qoder credentials |

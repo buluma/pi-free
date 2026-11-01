@@ -2,10 +2,89 @@ import { getProviderRegistry } from "./registry.ts";
 import {
 	formatStartupSummary,
 	getStartupSummary,
+	nativeRefreshFlags,
 } from "./startup-timing.ts";
-import { getLogPath, isFileLoggingEnabled } from "./logger.ts";
+import {
+	getLastLogWriteError,
+	getLogPath,
+	getLogWriteFailures,
+	isFileLoggingEnabled,
+} from "./logger.ts";
+import { getAllResponseCounters } from "./quota-monitor.ts";
+import { getRecentActions } from "./action-log.ts";
+import { getAutoFallback } from "./auto-fallback-status.ts";
+import { describePiAiResolution } from "./pi-ai-loader.ts";
+import type {
+	PiAiEntryResolution,
+	PiAiResolutionSnapshot,
+} from "./pi-ai-loader.ts";
 
-/** Render a credential-free diagnostic report for `/pi-free-health`. */
+/** The allow-listed pi-ai entries, in report order. */
+const PI_AI_ENTRIES = ["compat", "providers/all"] as const;
+
+/**
+ * `root@version`, or `none` — the one place this report formats a pi-ai copy,
+ * so the health and telemetry surfaces cannot drift apart.
+ */
+function describePiAiCopy(root: string | null, version: string | null): string {
+	return root === null ? "none" : `${root}@${version ?? "unknown"}`;
+}
+
+/** One entry's resolution, e.g. `on-disk via walk-up (/path@0.86.1)`. */
+function describePiAiEntry(resolution: PiAiEntryResolution): string {
+	const how = resolution.source ?? "unresolved";
+	const via = resolution.via ? ` via ${resolution.via}` : "";
+	const where = resolution.root
+		? ` (${describePiAiCopy(resolution.root, resolution.version)})`
+		: "";
+	return `${how}${via}${where}`;
+}
+
+/**
+ * pi-ai resolution section for `/pi-free-health` and `/free-telemetry`.
+ *
+ * The fast-path copy is rendered **separately** from the entry-aware result,
+ * because the #581 failure is "the bare specifier resolved a name+version-valid
+ * copy that cannot serve the entry": every other line can look healthy while
+ * streams die. Credential-free — absolute paths, versions and booleans, the
+ * same class of data this report already prints for the log path.
+ */
+export function formatPiAiResolutionLines(
+	snapshot: PiAiResolutionSnapshot,
+): string[] {
+	const lines = [
+		`pi-ai: ${snapshot.shadowed ? "SHADOWED" : "ok"}`,
+		`  fast path (bare specifier): ${describePiAiCopy(snapshot.fastPath.root, snapshot.fastPath.version)}`,
+	];
+	for (const entry of PI_AI_ENTRIES) {
+		lines.push(`  ${entry}: ${describePiAiEntry(snapshot.entries[entry])}`);
+	}
+	if (snapshot.shadowed) {
+		const missing = PI_AI_ENTRIES.filter(
+			(entry) => !snapshot.fastPath.defines[entry],
+		);
+		lines.push(
+			`  ↳ fast-path copy does not define ${missing.map((e) => `"${e}"`).join(", ")} (#581 shape)`,
+		);
+	}
+	lines.push(`  vendored bundle: ${snapshot.vendored ? "present" : "absent"}`);
+	// Session failures that fell off the fast path, deduped by the loader: the
+	// narrative behind a SHADOWED verdict, or the reason a Bun host recovered.
+	for (const event of snapshot.events) {
+		lines.push(
+			`  ↳ ${event.entry}: ${event.code} → ${event.recovered}` +
+				(event.resolvedFile ? ` (${event.resolvedFile})` : ""),
+		);
+	}
+	return lines;
+}
+
+/**
+ * Render a credential-free diagnostic report for `/pi-free-health`.
+ *
+ * Credential-free by construction: counts, ages, and status codes only —
+ * never API keys, tokens, response bodies, log tails, or config values.
+ */
 export function formatHealthReport(): string {
 	const startup = getStartupSummary();
 	const registry = getProviderRegistry();
@@ -15,7 +94,25 @@ export function formatHealthReport(): string {
 			: [],
 	);
 	const failures = [...startup.failures, ...startup.sessionStartFailures];
-	const problemCount = failures.length + networkFailures.length;
+	const outcomeFlags = nativeRefreshFlags(startup);
+	const emptyCatalogs = emptyCatalogFlags();
+	const responseIssues = responseOutcomeLines();
+	const logWriteFailures = getLogWriteFailures();
+	// pi-ai resolution (the doctor). This is the only section that can see the
+	// #581 shape: the fast path resolving a name+version-valid copy that cannot
+	// serve the entry, while every other line still reads healthy.
+	const piAi = describePiAiResolution();
+	const piAiBroken =
+		piAi.shadowed ||
+		PI_AI_ENTRIES.some((entry) => piAi.entries[entry].source === null);
+	const problemCount =
+		failures.length +
+		networkFailures.length +
+		outcomeFlags.length +
+		emptyCatalogs.length +
+		responseIssues.length +
+		(logWriteFailures > 0 ? 1 : 0) +
+		(piAiBroken ? 1 : 0);
 	const status = registry.size === 0 || problemCount > 0 ? "WARN" : "OK";
 	const logSuffix = isFileLoggingEnabled() ? "" : " (file logging disabled)";
 	const lines = [
@@ -25,17 +122,111 @@ export function formatHealthReport(): string {
 		`Log file: ${getLogPath()}${logSuffix}`,
 		"",
 		formatStartupSummary(),
+		"",
+		...formatPiAiResolutionLines(piAi),
 	];
 
 	if (networkFailures.length > 0) {
 		lines.push(`Network failures: ${networkFailures.join(", ")}`);
 	}
+	if (emptyCatalogs.length > 0) {
+		lines.push(`Empty catalogs: ${emptyCatalogs.join("; ")}`);
+	}
+	if (responseIssues.length > 0) {
+		lines.push(`Response issues: ${responseIssues.join("; ")}`);
+	}
 	if (failures.length > 0) {
 		lines.push(`Recorded failures: ${failures.join(", ")}`);
+	}
+	if (logWriteFailures > 0) {
+		const lastError = getLastLogWriteError();
+		lines.push(
+			`Log write failures: ${logWriteFailures} (sink: ${getLogPath()}${
+				lastError ? `; last: ${lastError}` : ""
+			})`,
+		);
 	}
 	if (registry.size === 0) {
 		lines.push("No providers are registered; check the log for setup errors.");
 	}
 
+	// Auto-fallback status (Q32 = B). Credential-free: only enabled flag,
+	// counts, and the last failure class — never keys, tokens, or models
+	// payload. Missing handle (extension not initialized yet) is treated as
+	// "not loaded" rather than "broken".
+	const fallback = getAutoFallback();
+	if (fallback) {
+		const fallbackStatus = fallback.getStatus();
+		const statusLine =
+			`auto_fallback: ${fallbackStatus.enabled ? "enabled" : "disabled"}` +
+			` (switches: ${fallbackStatus.switchCount}` +
+			(fallbackStatus.lastSwitchReason
+				? `, last: ${fallbackStatus.lastSwitchReason}`
+				: "") +
+			`${fallbackStatus.exhausted ? ", EXHAUSTED" : ""})`;
+		lines.push(statusLine);
+	}
+
+	// Recent user-action outcomes (toggles, restores, fallback switches).
+	// The file log carries the full trace; this is the paste-into-an-issue
+	// summary. Absent when no action ran yet this process.
+	const actions = getRecentActions().slice(0, 8);
+	if (actions.length > 0) {
+		lines.push(
+			`Recent actions: ${actions.map((a) => `[${a.kind}] ${a.summary}`).join("; ")}`,
+		);
+	}
+
 	return lines.join("\n");
+}
+
+/**
+ * Mn1 (#437): providers whose stored catalog is empty after a refresh.
+ * Distinguishes "refresh completed and published 0 models" (refreshOks > 0)
+ * from "refresh never ran" (no cacheNetwork evidence at all).
+ */
+function emptyCatalogFlags(): string[] {
+	const flags: string[] = [];
+	const startup = getStartupSummary();
+	const outcomeByProvider = new Map(
+		startup.cacheNetwork.map((entry) => [entry.provider, entry]),
+	);
+	for (const [providerId, entry] of getProviderRegistry()) {
+		if (entry.stored.all.length > 0 || entry.stored.free.length > 0) continue;
+		const outcome = outcomeByProvider.get(providerId);
+		// Only flag providers with refresh evidence. Auth-required providers
+		// whose auth resolves undefined without a key (StepFun, TokenRouter,
+		// AnyAPI, B.AI, OpenGateway, unconfigured Qoder) are never refreshed by
+		// Pi at all — flagging them would flip health to WARN on installs that
+		// were previously fine (Mn1 false-alarm regression).
+		if (!outcome) continue;
+		if (outcome.refreshOks > 0) {
+			flags.push(`${providerId}: empty after completed refresh (0 models)`);
+		} else {
+			flags.push(`${providerId}: no models; refresh never completed`);
+		}
+	}
+	return flags;
+}
+
+/** M2/Mn3 (#437): per-provider 401/403/429/5xx and quota-header-drift counts. */
+function responseOutcomeLines(): string[] {
+	const lines: string[] = [];
+	for (const [providerId, counters] of getAllResponseCounters()) {
+		const parts: string[] = [];
+		if (counters.authFailures > 0) {
+			parts.push(`${counters.authFailures} auth-fail (401/403)`);
+		}
+		if (counters.rateLimited > 0) {
+			parts.push(`${counters.rateLimited} rate-limited (429)`);
+		}
+		if (counters.serverErrors > 0) {
+			parts.push(`${counters.serverErrors} server-error (5xx)`);
+		}
+		if (counters.quotaHeaderDrift > 0) {
+			parts.push(`${counters.quotaHeaderDrift} quota-header-drift`);
+		}
+		if (parts.length > 0) lines.push(`${providerId}: ${parts.join(", ")}`);
+	}
+	return lines;
 }
