@@ -12,14 +12,25 @@ import type { Model } from "@earendil-works/pi-ai/compat";
 import { applyHidden } from "../../config.ts";
 import {
 	BASE_URL_CLINE,
+	CLINE_EXTENSION_VERSION,
 	DEFAULT_FETCH_TIMEOUT_MS,
 	PROVIDER_CLINE,
+	VS_CODE_VERSION,
 } from "../../constants.ts";
 import { isFreeModel } from "../../lib/registry.ts";
-import type { ProviderModelConfig } from "../../lib/types.ts";
+import { withGatewayCompat } from "../../lib/native-provider.ts";
+import { createLogger } from "../../lib/logger.ts";
+import type { ProviderModelConfig as PiProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import {
+	isChatModelConfig,
+	type ProviderModelConfig,
+} from "../../lib/types.ts";
+import { getClineProviderHeaders } from "./cline-headers.ts";
 import { safeEnrichModelsWithModelsDev } from "../../lib/model-metadata.ts";
 import { getProxyModelCompat } from "../../lib/provider-compat.ts";
 import { cleanModelName, fetchWithRetry } from "../../lib/util.ts";
+
+const _logger = createLogger("cline-models");
 
 interface ClineRaw {
 	id: string;
@@ -55,9 +66,6 @@ interface ClineRecommendedModelsResponse {
 	recommended?: ClineRecommendedModel[];
 	free?: ClineRecommendedModel[];
 }
-
-const VS_CODE_VERSION = "1.109.3";
-const CLINE_EXTENSION_VERSION = "3.76.0";
 
 function buildClineFetchHeaders(): Record<string, string> {
 	return {
@@ -133,62 +141,21 @@ function modelFromRecommended(
 	};
 }
 
-// Cline's free endpoint can use a provider-qualified ID while the catalog
-// uses the leaf ID (or vice versa). It also occasionally gives a dated
-// catalog entry for an otherwise identical recommended model, for example
-// `deepseek-v4-flash` -> `deepseek-v4-flash-0731`.
-//
-// Keep this deliberately narrow: only valid date-shaped release suffixes are
-// removed, and two provider-qualified IDs must have the same qualifier. This
-// avoids turning similarly named paid variants (such as `-pro`) into free ones.
-const CLINE_RELEASE_DATE_SUFFIX =
-	/(?:-(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])|-(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])|-(?:19|20)\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01]))$/;
-
-function splitClineModelId(id: string): {
-	qualifier?: string;
-	leaf: string;
-} {
-	const separator = id.lastIndexOf("/");
-	return separator < 0
-		? { leaf: id }
-		: { qualifier: id.slice(0, separator), leaf: id.slice(separator + 1) };
-}
-
-function stripClineReleaseDateSuffix(id: string): string {
-	return id.replace(CLINE_RELEASE_DATE_SUFFIX, "");
-}
-
-function isClineFreeToTryId(
-	modelId: string,
-	freeToTryIds: ReadonlySet<string>,
-): boolean {
-	if (freeToTryIds.has(modelId)) return true;
-
-	const model = splitClineModelId(modelId);
-	const normalizedModelLeaf = stripClineReleaseDateSuffix(model.leaf);
-	for (const freeToTryId of freeToTryIds) {
-		const free = splitClineModelId(freeToTryId);
-		if (model.qualifier && free.qualifier && model.qualifier !== free.qualifier) {
-			continue;
-		}
-		if (
-			normalizedModelLeaf === stripClineReleaseDateSuffix(free.leaf)
-		) {
-			return true;
-		}
-	}
-	return false;
-}
+// Cline's recommended-models `free` list is the authoritative free-to-try
+// source, and both it and the catalog use provider-qualified IDs. Match
+// exactly: fuzzy aliasing (e.g. stripping date suffixes) turned genuinely
+// paid dated variants like `deepseek/deepseek-v4-flash-0731` into free
+// models that then fail with 402 insufficient credits at request time.
 
 function modelFromCatalog(
 	info: ClineRaw,
 	freeToTryIds: ReadonlySet<string>,
 ): ProviderModelConfig & { _pricingKnown?: boolean } {
-	const isReasoning = !!(
+	const isReasoning = Boolean(
 		info.supported_parameters?.includes("include_reasoning") ||
-		info.supported_parameters?.includes("reasoning")
+		info.supported_parameters?.includes("reasoning"),
 	);
-	const isFreeToTry = isClineFreeToTryId(info.id, freeToTryIds);
+	const isFreeToTry = freeToTryIds.has(info.id);
 	const inputCost = isFreeToTry ? 0 : parsePricing(info.pricing?.prompt);
 	const outputCost = isFreeToTry ? 0 : parsePricing(info.pricing?.completion);
 	const cacheRead = isFreeToTry
@@ -263,7 +230,7 @@ async function fetchClineCatalogModels(): Promise<ClineRaw[]> {
  * Fetch models from Cline.
  * @param freeOnly - If true, return only zero-cost/free-to-try models
  */
-export async function fetchClineModels(
+async function fetchClineModels(
 	freeOnly = false,
 ): Promise<ProviderModelConfig[]> {
 	const [catalogModels, recommendedFreeModels] = await Promise.all([
@@ -302,13 +269,6 @@ export async function fetchClineModels(
 	);
 }
 
-/**
- * Fetch only free models (backward compatibility).
- */
-export async function fetchClineFreeModels(): Promise<ProviderModelConfig[]> {
-	return fetchClineModels(true);
-}
-
 // =============================================================================
 // Native provider catalog (createProvider object form)
 // =============================================================================
@@ -327,7 +287,12 @@ export async function fetchClineCatalog(options?: {
 	let all: ProviderModelConfig[];
 	try {
 		all = await fetchClineModels(false);
-	} catch {
+	} catch (error) {
+		// Genuine fetch failures must stay diagnosable (abort is handled below
+		// without logging, per convention #15) — log and retain via empty arrays.
+		_logger.warn("Cline catalog fetch failed; retaining previous list", {
+			error: error instanceof Error ? error.message : String(error),
+		});
 		all = [];
 	}
 
@@ -343,26 +308,31 @@ export async function fetchClineCatalog(options?: {
 
 /**
  * Convert a fetched ProviderModelConfig into the concrete pi-ai
- * `Model<"cline-xml-tools">` shape a native provider's getModels() returns.
- * Adds the provider id, the custom wire api, and the gateway baseUrl that the
- * legacy registerProvider config form used to supply implicitly.
+ * `Model<"openai-completions">` shape a native provider's getModels() returns.
+ * Adds the provider id, the standard OpenAI Chat Completions wire api, and the
+ * gateway baseUrl that the legacy registerProvider config form used to supply
+ * implicitly. Cline's endpoint speaks vanilla OpenAI Chat Completions (#433).
  */
-export function toClineModel(
-	m: ProviderModelConfig,
-): Model<"cline-xml-tools"> {
-	return {
+function toClineModel(m: ProviderModelConfig): Model<"openai-completions"> {
+	return withGatewayCompat({
 		...m,
-		api: "cline-xml-tools",
+		api: "openai-completions",
 		provider: PROVIDER_CLINE,
 		// The legacy registration supplied a single provider-level baseUrl;
 		// every Cline model shares the Cline gateway.
 		baseUrl: BASE_URL_CLINE,
-	} as Model<"cline-xml-tools">;
+		// pi-ai merges only the MODEL's headers into requests (not
+		// provider.headers) — stamp the shared Cline identity record so the
+		// gateway sees a genuine Cline client (see cline-headers.ts).
+		headers: getClineProviderHeaders(),
+	} as Model<"openai-completions">);
 }
 
 /** Convert a batch of model configs to native Model objects. */
 export function toClineModels(
-	models: ProviderModelConfig[],
-): Model<"cline-xml-tools">[] {
-	return models.map(toClineModel);
+	models: PiProviderModelConfig[],
+): Model<"openai-completions">[] {
+	// Chat-only catalog: image/classifier entries cannot be served as chat
+	// models (pi 1.x union).
+	return models.filter(isChatModelConfig).map(toClineModel);
 }

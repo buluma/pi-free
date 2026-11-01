@@ -20,9 +20,8 @@ describe("startup-timing", () => {
 	});
 
 	it("measurePhase records a phase with a non-negative duration", async () => {
-		const { beginStartup, measurePhase, getStartupSummary } = await import(
-			"../lib/startup-timing.ts"
-		);
+		const { beginStartup, measurePhase, getStartupSummary } =
+			await import("../lib/startup-timing.ts");
 		beginStartup();
 
 		const result = measurePhase("work", () => {
@@ -58,9 +57,8 @@ describe("startup-timing", () => {
 	});
 
 	it("timeProvider records success and rethrows failures", async () => {
-		const { beginStartup, timeProvider, getStartupSummary } = await import(
-			"../lib/startup-timing.ts"
-		);
+		const { beginStartup, timeProvider, getStartupSummary } =
+			await import("../lib/startup-timing.ts");
 		beginStartup();
 
 		const ok = await timeProvider("good", async () => 42);
@@ -82,9 +80,8 @@ describe("startup-timing", () => {
 	});
 
 	it("sorts providers slowest-first in the summary", async () => {
-		const { beginStartup, timeProvider, getStartupSummary } = await import(
-			"../lib/startup-timing.ts"
-		);
+		const { beginStartup, timeProvider, getStartupSummary } =
+			await import("../lib/startup-timing.ts");
 		beginStartup();
 
 		// Use well-separated delays so ordering survives OS timer jitter.
@@ -100,8 +97,8 @@ describe("startup-timing", () => {
 		expect(order[0]).toBe("slow");
 		// Durations are monotonically non-increasing (slowest-first invariant).
 		for (let i = 1; i < summary.providers.length; i++) {
-			expect(summary.providers[i - 1].durationMs).toBeGreaterThanOrEqual(
-				summary.providers[i].durationMs,
+			expect(summary.providers[i - 1]!.durationMs).toBeGreaterThanOrEqual(
+				summary.providers[i]!.durationMs,
 			);
 		}
 	});
@@ -197,9 +194,8 @@ describe("startup-timing", () => {
 	});
 
 	it("beginStartup resets state for a fresh run", async () => {
-		const { beginStartup, timeProvider, getStartupSummary } = await import(
-			"../lib/startup-timing.ts"
-		);
+		const { beginStartup, timeProvider, getStartupSummary } =
+			await import("../lib/startup-timing.ts");
 		beginStartup();
 		await timeProvider("first", () => sleep(1));
 		expect(getStartupSummary().providers).toHaveLength(1);
@@ -207,6 +203,30 @@ describe("startup-timing", () => {
 		beginStartup();
 		expect(getStartupSummary().providers).toHaveLength(0);
 		expect(getStartupSummary().cacheHits).toBe(0);
+	});
+
+	it("totalMs is measured from first module load, not beginStartup", async () => {
+		const { beginStartup, getStartupSummary } =
+			await import("../lib/startup-timing.ts");
+		beginStartup();
+
+		// The origin is the module-scope timestamp captured at import time,
+		// so any elapsed time before beginStartup/finalize is included too.
+		await sleep(20);
+		const summary = getStartupSummary();
+		expect(summary.totalMs).toBeGreaterThanOrEqual(20);
+		expect(summary.moduleGraphMs).toBeGreaterThanOrEqual(0);
+		expect(summary.moduleGraphMs).toBeLessThanOrEqual(summary.totalMs);
+	});
+
+	it("formatStartupSummary states the module-load origin", async () => {
+		const { beginStartup, formatStartupSummary } =
+			await import("../lib/startup-timing.ts");
+		beginStartup();
+
+		const text = formatStartupSummary();
+		expect(text).toContain("first module load");
+		expect(text).toContain("module graph");
 	});
 
 	it("beginSessionStart keeps startup data but replaces the previous session", async () => {
@@ -225,5 +245,96 @@ describe("startup-timing", () => {
 			expect.objectContaining({ label: "new" }),
 		]);
 		expect(getStartupSummary().totalMs).toBeGreaterThanOrEqual(0);
+	});
+
+	it("records native refresh outcome counters per provider (M1)", async () => {
+		const {
+			beginStartup,
+			recordNativeAbort,
+			recordNativeEmptyRetain,
+			recordNativeRefreshOk,
+			recordNativeRestored,
+			getStartupSummary,
+		} = await import("../lib/startup-timing.ts");
+		beginStartup();
+
+		recordNativeAbort("prov-a");
+		recordNativeAbort("prov-a");
+		recordNativeEmptyRetain("prov-a");
+		recordNativeRefreshOk("prov-a", 12);
+		recordNativeRestored("prov-a", 3 * 60 * 60 * 1000);
+		recordNativeRestored("prov-b", 2 * 24 * 60 * 60 * 1000);
+
+		const summary = getStartupSummary();
+		const entryA = summary.cacheNetwork.find(
+			(entry) => entry.provider === "prov-a",
+		);
+		expect(entryA).toMatchObject({
+			aborts: 2,
+			emptyRetains: 1,
+			refreshOks: 1,
+			restoredCount: 1,
+			lastRefreshModelCount: 12,
+			storeAgeMs: 3 * 60 * 60 * 1000,
+		});
+		const entryB = summary.cacheNetwork.find(
+			(entry) => entry.provider === "prov-b",
+		);
+		expect(entryB?.restoredCount).toBe(1);
+		expect(entryB?.storeAgeMs).toBe(2 * 24 * 60 * 60 * 1000);
+	});
+
+	it("nativeRefreshFlags lists aborts, empty retains, and stale stores (M1)", async () => {
+		const {
+			beginStartup,
+			recordNativeAbort,
+			recordNativeEmptyRetain,
+			recordNativeRestored,
+			nativeRefreshFlags,
+			getStartupSummary,
+		} = await import("../lib/startup-timing.ts");
+		beginStartup();
+
+		recordNativeAbort("ab-prov");
+		recordNativeAbort("ab-prov");
+		recordNativeEmptyRetain("er-prov");
+		recordNativeRestored("old-prov", 8 * 24 * 60 * 60 * 1000); // 8 days > 7d flag
+
+		const flags = nativeRefreshFlags(getStartupSummary());
+		expect(flags).toEqual(
+			expect.arrayContaining([
+				expect.stringContaining("ab-prov: 2 aborts"),
+				expect.stringContaining("er-prov: 1 empty-retain"),
+				expect.stringContaining("old-prov: store"),
+			]),
+		);
+
+		// A recent restore does not flag a store age.
+		const { beginStartup: reset, recordNativeRestored: record } =
+			await import("../lib/startup-timing.ts");
+		reset();
+		record("fresh-prov", 60 * 60 * 1000); // 1h
+		expect(nativeRefreshFlags(getStartupSummary())).toHaveLength(0);
+	});
+
+	it("formatStartupSummary surfaces native refresh outcomes (M1)", async () => {
+		const {
+			beginStartup,
+			recordNativeAbort,
+			recordNativeRefreshOk,
+			recordNativeRestored,
+			formatStartupSummary,
+		} = await import("../lib/startup-timing.ts");
+		beginStartup();
+
+		recordNativeAbort("ab-prov");
+		recordNativeRefreshOk("ok-prov", 7);
+		recordNativeRestored("ok-prov", 2 * 60 * 60 * 1000);
+
+		const text = formatStartupSummary();
+		expect(text).toContain("Native refresh flags:");
+		expect(text).toContain("ab-prov: 1 abort");
+		expect(text).toContain("refresh ok 1 (7 models)");
+		expect(text).toContain("store 2h old");
 	});
 });

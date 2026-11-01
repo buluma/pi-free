@@ -1,11 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import type { Model, Api, Context } from "@earendil-works/pi-ai/compat";
+import type { Model, Api } from "@earendil-works/pi-ai/compat";
 import {
 	createOpenCodeHeaders,
 	createOpenCodeStreamSimple,
@@ -59,21 +59,78 @@ describe("opencode-session fallback resolution", () => {
 		).toBe("https://opencode.ai/zen/go/v1");
 	});
 
+	it("routes free-tier Zen URLs to /inference/v1 (#613)", () => {
+		for (const url of [
+			"https://opencode.ai/zen/v1",
+			"https://opencode.ai/zen/v1/",
+			"https://opencode.ai/zen",
+		]) {
+			expect(getOpenCodeModelBaseUrl("openai-completions", url)).toBe(
+				"https://opencode.ai/inference/v1",
+			);
+		}
+		expect(
+			getOpenCodeModelBaseUrl(
+				"openai-completions",
+				"https://opencode.ai/inference/v1",
+			),
+		).toBe("https://opencode.ai/inference/v1");
+	});
+
 	it("generates CLI-compatible session and request headers", () => {
 		const tracker = createOpenCodeSessionTracker();
 		const first = createOpenCodeHeaders(tracker);
 		const second = createOpenCodeHeaders(tracker);
 
-		expect(first["User-Agent"]).toBe("opencode/1.15.5");
+		expect(first["User-Agent"]).toBe("opencode/1.19.0");
 		expect(first["x-opencode-client"]).toBe("cli");
 		expect(first["x-opencode-session"]).toMatch(
-			/^ses_[0-9a-f]+[0-9A-Za-z]{14}$/,
+			/^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/,
 		);
 		expect(first["x-opencode-request"]).toMatch(
-			/^msg_[0-9a-f]+[0-9A-Za-z]{14}$/,
+			/^msg_[0-9a-f]{12}[0-9A-Za-z]{14}$/,
 		);
+		expect(first["x-opencode-project"]).toBe("global");
 		expect(second["x-opencode-session"]).toBe(first["x-opencode-session"]);
 		expect(second["x-opencode-request"]).not.toBe(first["x-opencode-request"]);
+	});
+
+	it("encodes ses descending and msg ascending with the same ms base", () => {
+		// Freeze the clock so both ids land in the same millisecond. Without
+		// this the assertions are timing-sensitive: if Date.now() ticks between
+		// the getSessionId() and nextRequestId() calls, the ULID counter resets
+		// and the ms bases differ by 1 (flaky on loaded CI runners, e.g.
+		// 176323391n vs 176323390n). The implementation mirrors the CLI, which
+		// has the same reset-on-ms-tick behavior — only the test needs a stable
+		// clock.
+		const frozenNow = 1_700_000_000_000;
+		const nowSpy = vi.spyOn(Date, "now").mockReturnValue(frozenNow);
+		try {
+			// The CLI's identifier.ts encodes `~timestamp<<12|counter` (descending)
+			// and `timestamp<<12|counter` (ascending). Two ids created in the same
+			// millisecond must share the same timestamp base, with the per-call
+			// counter advancing in the low 12 bits — ses first (counter=1), then
+			// msg (counter=2). A bug that swapped the directions (or dropped the
+			// complement) would fail here even though the shape assertions pass.
+			const tracker = createOpenCodeSessionTracker();
+			const session = tracker.getSessionId().slice(4); // strip ses_
+			const request = tracker.nextRequestId().slice(4); // strip msg_
+
+			const sesComplement =
+				~BigInt(`0x${session.slice(0, 12)}`) & 0xffffffffffffn;
+			const msgTime = BigInt(`0x${request.slice(0, 12)}`);
+
+			// Same timestamp base (high 36 bits = milliseconds).
+			expect(msgTime >> 12n).toBe(sesComplement >> 12n);
+			// Counter advanced monotonically within the same ms (ses=1, msg=2).
+			expect(msgTime & 0xfffn).toBe((sesComplement & 0xfffn) + 1n);
+
+			// Random suffixes are full-length (14 base62 chars) on both.
+			expect(session.slice(12)).toHaveLength(14);
+			expect(request.slice(12)).toHaveLength(14);
+		} finally {
+			nowSpy.mockRestore();
+		}
 	});
 
 	it("resolves pi-ai subpaths when loaded from an isolated directory", () => {
@@ -312,7 +369,9 @@ console.log(JSON.stringify({
 			baseUrl: "https://api.opencode.ai/anthropic",
 		} as Model<Api>;
 
-		const context = { messages: [] } as unknown as Context;
+		const context = { messages: [] } as unknown as Parameters<
+			typeof streamSimple
+		>[1];
 
 		// This should NOT throw — it will attempt to import the anthropic
 		// subpath via importPiAiSubpath, which uses the fixed fallback.
@@ -362,7 +421,9 @@ console.log(JSON.stringify({
 			baseUrl: "https://api.opencode.ai/v1",
 		} as Model<Api>;
 
-		const context = { messages: [] } as unknown as Context;
+		const context = { messages: [] } as unknown as Parameters<
+			typeof streamSimple
+		>[1];
 
 		const stream = streamSimple(openaiModel, context);
 		expect(stream).toBeDefined();

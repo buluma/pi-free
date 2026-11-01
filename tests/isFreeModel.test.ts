@@ -34,47 +34,53 @@ function createModel(
 describe("isFreeModel - Route A (pricing-exposed providers)", () => {
 	const pricingExposedProviders = ["openrouter", "opencode", "kilo", "cline"];
 
-	it.each(
-		pricingExposedProviders,
-	)("%s: returns true when cost is zero", (provider) => {
-		const model = createModel("Some Model", { input: 0, output: 0 });
-		expect(isFreeModel({ ...model, provider })).toBe(true);
-	});
+	it.each(pricingExposedProviders)(
+		"%s: returns true when cost is zero",
+		(provider) => {
+			const model = createModel("Some Model", { input: 0, output: 0 });
+			expect(isFreeModel({ ...model, provider })).toBe(true);
+		},
+	);
 
-	it.each(
-		pricingExposedProviders,
-	)("%s: returns false when input cost > 0", (provider) => {
-		const model = createModel("Some Model", { input: 1, output: 0 });
-		expect(isFreeModel({ ...model, provider })).toBe(false);
-	});
+	it.each(pricingExposedProviders)(
+		"%s: returns false when input cost > 0",
+		(provider) => {
+			const model = createModel("Some Model", { input: 1, output: 0 });
+			expect(isFreeModel({ ...model, provider })).toBe(false);
+		},
+	);
 
-	it.each(
-		pricingExposedProviders,
-	)("%s: returns false when output cost > 0", (provider) => {
-		const model = createModel("Some Model", { input: 0, output: 1 });
-		expect(isFreeModel({ ...model, provider })).toBe(false);
-	});
+	it.each(pricingExposedProviders)(
+		"%s: returns false when output cost > 0",
+		(provider) => {
+			const model = createModel("Some Model", { input: 0, output: 1 });
+			expect(isFreeModel({ ...model, provider })).toBe(false);
+		},
+	);
 
-	it.each(
-		pricingExposedProviders,
-	)("%s: returns true if name contains 'free' even when cost > 0 (OR logic)", (provider) => {
-		const model = createModel("Something Free", { input: 1, output: 1 });
-		expect(isFreeModel({ ...model, provider })).toBe(true);
-	});
+	it.each(pricingExposedProviders)(
+		"%s: returns true if name contains 'free' even when cost > 0 (OR logic)",
+		(provider) => {
+			const model = createModel("Something Free", { input: 1, output: 1 });
+			expect(isFreeModel({ ...model, provider })).toBe(true);
+		},
+	);
 
-	it.each(
-		pricingExposedProviders,
-	)("%s: returns true when cost is zero even if name does NOT contain 'free'", (provider) => {
-		const model = createModel("GPT-4", { input: 0, output: 0 });
-		expect(isFreeModel({ ...model, provider })).toBe(true);
-	});
+	it.each(pricingExposedProviders)(
+		"%s: returns true when cost is zero even if name does NOT contain 'free'",
+		(provider) => {
+			const model = createModel("GPT-4", { input: 0, output: 0 });
+			expect(isFreeModel({ ...model, provider })).toBe(true);
+		},
+	);
 
-	it.each(
-		pricingExposedProviders,
-	)("%s: returns false when cost > 0 AND name does NOT contain 'free'", (provider) => {
-		const model = createModel("GPT-4 Paid", { input: 1, output: 1 });
-		expect(isFreeModel({ ...model, provider })).toBe(false);
-	});
+	it.each(pricingExposedProviders)(
+		"%s: returns false when cost > 0 AND name does NOT contain 'free'",
+		(provider) => {
+			const model = createModel("GPT-4 Paid", { input: 1, output: 1 });
+			expect(isFreeModel({ ...model, provider })).toBe(false);
+		},
+	);
 });
 
 describe("isFreeModel - Route B (non-pricing-exposed providers)", () => {
@@ -90,32 +96,35 @@ describe("isFreeModel - Route B (non-pricing-exposed providers)", () => {
 		"some-new-provider",
 	];
 
-	it.each(
-		nonPricingProviders,
-	)("%s: returns true when name contains 'free' (case insensitive)", (provider) => {
-		const model = createModel("Llama Free Edition", { input: 1, output: 1 });
-		// Pass allModels with all costs === 0 to trigger Route B (name-based)
-		const allModels = [createModel("Model A", { input: 0, output: 0 })];
-		expect(isFreeModel({ ...model, provider }, allModels)).toBe(true);
-	});
+	it.each(nonPricingProviders)(
+		"%s: returns true when name contains 'free' (case insensitive)",
+		(provider) => {
+			const model = createModel("Llama Free Edition", { input: 1, output: 1 });
+			// Pass allModels with all costs === 0 to trigger Route B (name-based)
+			const allModels = [createModel("Model A", { input: 0, output: 0 })];
+			expect(isFreeModel({ ...model, provider }, allModels)).toBe(true);
+		},
+	);
 
-	it.each(
-		nonPricingProviders,
-	)("%s: returns false when name does NOT contain 'free' even if cost is 0", (provider) => {
-		const model = createModel("GPT-4", { input: 0, output: 0 });
-		// Pass allModels with all costs === 0 to trigger Route B (name-based)
-		const allModels = [createModel("Model A", { input: 0, output: 0 })];
-		expect(isFreeModel({ ...model, provider }, allModels)).toBe(false);
-	});
+	it.each(nonPricingProviders)(
+		"%s: returns false when name does NOT contain 'free' even if cost is 0",
+		(provider) => {
+			const model = createModel("GPT-4", { input: 0, output: 0 });
+			// Pass allModels with all costs === 0 to trigger Route B (name-based)
+			const allModels = [createModel("Model A", { input: 0, output: 0 })];
+			expect(isFreeModel({ ...model, provider }, allModels)).toBe(false);
+		},
+	);
 
-	it.each(
-		nonPricingProviders,
-	)("%s: returns false when cost > 0 and name doesn't contain 'free'", (provider) => {
-		const model = createModel("GPT-4", { input: 2, output: 6 });
-		// Pass allModels with all costs === 0 to trigger Route B (name-based)
-		const allModels = [createModel("Model A", { input: 0, output: 0 })];
-		expect(isFreeModel({ ...model, provider }, allModels)).toBe(false);
-	});
+	it.each(nonPricingProviders)(
+		"%s: returns false when cost > 0 and name doesn't contain 'free'",
+		(provider) => {
+			const model = createModel("GPT-4", { input: 2, output: 6 });
+			// Pass allModels with all costs === 0 to trigger Route B (name-based)
+			const allModels = [createModel("Model A", { input: 0, output: 0 })];
+			expect(isFreeModel({ ...model, provider }, allModels)).toBe(false);
+		},
+	);
 
 	it("matches 'free' in various parts of the name", () => {
 		const providers = ["nvidia", "mistral"];
@@ -211,7 +220,7 @@ describe("isFreeModel - freemium providers behavior", () => {
 			isFreeModel({ ...m, provider: "nvidia" }, models),
 		);
 		expect(freeModels).toHaveLength(1);
-		expect(freeModels[0].name).toBe("llama3.2-free");
+		expect(freeModels[0]!.name).toBe("llama3.2-free");
 	});
 });
 
@@ -373,5 +382,36 @@ describe("isFreeModel - authoritative free flag", () => {
 				_isFree: false,
 			}),
 		).toBe(false);
+	});
+});
+
+describe("isFreeModel - pricing-exposure memo", () => {
+	it("returns a stable verdict across repeated calls with the same catalog", () => {
+		const paid = createModel("Paid Model", { input: 5, output: 30 });
+		const free = createModel("Free Model", { input: 0, output: 0 });
+		const catalog = [paid, free];
+
+		const first = catalog.map((m) => isFreeModel(m, catalog));
+		const second = catalog.map((m) => isFreeModel(m, catalog));
+		expect(second).toEqual(first);
+		expect(first).toEqual([false, true]);
+	});
+
+	it("evaluates each catalog array independently", () => {
+		const priced = [
+			createModel("Paid Model", { input: 5, output: 30 }),
+			createModel("Free Model", { input: 0, output: 0 }),
+		];
+		const unpriced = [
+			createModel("Some Model", { input: 0, output: 0 }),
+			createModel("Other Model", { input: 0, output: 0 }),
+		];
+
+		// Priced catalog: zero-cost model is free (Route A).
+		expect(isFreeModel(priced[1]!, priced)).toBe(true);
+		// Unpriced catalog: name without "free" is not free (Route B).
+		expect(isFreeModel(unpriced[0]!, unpriced)).toBe(false);
+		// Revisit the first catalog: the cached verdict must still apply.
+		expect(isFreeModel(priced[1]!, priced)).toBe(true);
 	});
 });

@@ -22,7 +22,18 @@ Most pi-free providers now use Pi's native `registerProvider(provider)` surface.
 - retain the previous catalog after an empty or failed refresh; and
 - keep their complete catalog in memory while Pi applies the current free/all filter.
 
-FastRouter and Qoder now use the native provider lifecycle alongside the other migrated providers. Pi owns the OpenCode, OpenCode Go, and OpenRouter built-in catalogs. See [configuration](configuration.md#model-stores-and-caches) for cache locations, including Ollama Cloud's intentional compatibility-cache exception.
+FastRouter and Qoder now use the native provider lifecycle alongside the other migrated providers. Pi owns the OpenCode, OpenCode Go, and OpenRouter built-in catalogs. The `opencode-free` wrapper captures Pi's built-in metadata, then performs one detached `GET /inference/v1/models` refresh after session start so new or retired Zen models are reflected without delaying Pi startup; the `opencode-go` wrapper does the same against the Go tier's public `GET /zen/go/v1/models` endpoint, so Go models OpenCode ships between Pi releases are not stuck on Pi's build-time snapshot. The `openrouter` wrapper does the same against the public `GET /api/v1/models` endpoint: known model IDs keep Pi's curated metadata, while models that are new since Pi's release are synthesized from the endpoint's pricing, context-window, modality, and reasoning data. All three refreshes are detached, deduplicated per process, and never block session start; a failed or empty fetch retains the cached catalog and is written to `~/.pi/free.log` instead of rethrowing into Pi's `Could not refresh …; showing cached models` warning. See [configuration](configuration.md#model-stores-and-caches) for cache locations, including Ollama Cloud's intentional compatibility-cache exception.
+
+## `glob` tool and OpenCode Zen free-tier compatibility
+
+OpenCode Zen applies client-compatibility checks that can change over time. pi-free supplies familiar lowercase tool names such as `bash`, `edit`, `glob`, `grep`, and `read`; Pi's file finder is named `find`, and `grep` is not in its default roster. Tool/header compatibility alone is insufficient for the free inference path.
+
+pi-free therefore:
+
+- registers Pi's built-in `find` definition under the name **`glob`** (`createFindToolDefinition`), so the tool keeps Pi's own implementation — schema, `.gitignore` handling, truncation, and the host's search backend. pi-free adds no dependency and spawns nothing itself, so this stays OS-agnostic; and
+- adds `glob` and `grep` to that run's selected tools when the selected model is on `opencode-free` (`event.systemPromptOptions.selectedTools`). The change is per-turn, so no other provider's request changes and nothing is activated globally.
+
+The `glob` tool is registered for every session but only selected on `opencode-free` turns. All free models additionally receive the default 31-character system metadata frame `<env>Working directory: .</env>`. This context-relative frame keeps Pi's own instructions and tool state intact; it does not copy OpenCode's persona or native tool instructions, alter persisted transcripts, or require the OpenCode CLI. The keyed Go stream is unchanged. `opencode-free` inference also sends Zen's anonymous `public` bearer instead of the stored account credential (the keyed free-tier lane is rejected upstream); `opencode-go` keeps its credential. See [providers](providers.md#opencode-and-opencode-go).
 
 ## Coding Index (CI) scores
 
@@ -67,8 +78,6 @@ For reproducible import-inclusive measurements, run `npx tsx scripts/bench-start
 
 Most providers use OpenAI-compatible APIs. Notable custom integrations are:
 
-- **Cline** — native provider with the custom `cline-xml-tools` wire API and XML message/tool reshaping.
-- **OpenModel** — native Anthropic Messages API provider.
 - **Qoder** — native provider with Qoder authentication, COSY request signing, static catalog persistence, and custom streaming compatibility.
 
 See [Provider catalog & auth](providers.md) for setup details.

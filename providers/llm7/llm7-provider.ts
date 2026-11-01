@@ -32,22 +32,19 @@
  * module performs no freshness gating of its own so the two never double-throttle.
  */
 
-import {
-	openAICompletionsApi,
-	type Api,
-	type Model,
-	type Provider,
-	type RefreshModelsContext,
+import type {
+	Model,
+	Provider,
+	RefreshModelsContext,
 } from "@earendil-works/pi-ai/compat";
 import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
-import { getLlm7ShowPaid } from "../../config.ts";
 import { BASE_URL_LLM7, PROVIDER_LLM7 } from "../../constants.ts";
 import { isFreeModel } from "../../lib/registry.ts";
 import {
 	filterNativeModels,
-	persistNativeProviderModels,
-	restoreNativeProviderModels,
+	refreshNativeProviderModels,
 } from "../../lib/native-provider.ts";
+import { lazyOpenAICompletionsApi } from "../../lib/lazy-compat.ts";
 import { enhanceWithCI, type StoredModels } from "../../provider-helper.ts";
 import { llm7Auth } from "./llm7-auth.ts";
 import { fetchLlm7Catalog, toLlm7Models } from "./llm7-models.ts";
@@ -70,7 +67,7 @@ export interface Llm7NativeProvider {
  * source of truth.
  */
 export function createLlm7Provider(): Llm7NativeProvider {
-	const streams = openAICompletionsApi();
+	const streams = lazyOpenAICompletionsApi();
 
 	// Display-ready catalogs (CI-enhanced + converted to Model). Typed as
 	// StoredModels (ProviderModelConfig[]) for registerWithGlobalToggle; the
@@ -96,8 +93,25 @@ export function createLlm7Provider(): Llm7NativeProvider {
 		stored.free = next.free;
 	}
 
+	// Seed the static selector catalog at assembly so models are visible
+	// before the first refresh completes. Fresh installs have an empty
+	// store, and refresh publication can be superseded by a concurrent
+	// refresh (Pi aborts the older generation) — without this seed the
+	// catalog stays empty until an uncontested refresh lands. Refresh
+	// overwrites these on success and retains them on failure, exactly
+	// like the opengateway/qoder static seeds.
+	{
+		const seed = fetchLlm7Catalog();
+		ingest(seed.all, seed.free);
+	}
+
 	async function refreshModels(context: RefreshModelsContext): Promise<void> {
-		await restoreNativeProviderModels(
+		// Free split of the most recent build, kept beside the flat list the
+		// shared helper passes through (see the fetch callback below).
+		let fetchedFree: Llm7Model[] = [];
+		// Shared skeleton: restore → allowNetwork gate → abort checks → fetch →
+		// empty-retain → persist, with the M1 counters recorded centrally.
+		await refreshNativeProviderModels(
 			PROVIDER_LLM7,
 			context,
 			(storedModels: Llm7Model[]) => {
@@ -106,31 +120,19 @@ export function createLlm7Provider(): Llm7NativeProvider {
 					isFreeModel({ ...model, provider: PROVIDER_LLM7 }, storedModels),
 				);
 			},
-		);
-
-		// Offline init stops here: serve the store only.
-		if (!context.allowNetwork || context.signal?.aborted) return;
-
-		// Online: build the static selector catalog. This is purely local (no
-		// fetch, no credential) — LLM7's selectors never change.
-		const { all, free } = fetchLlm7Catalog();
-		if (context.signal?.aborted) return;
-
-		// Retain the previous list on a degenerate result (poisoning guard —
-		// e.g. every selector hidden via hidden_models config).
-		if (all.length === 0) return;
-
-		const next = prepare(all, free);
-		await persistNativeProviderModels(
-			PROVIDER_LLM7,
-			context,
-			// next.all holds full Model objects at runtime (toLlm7Models output);
-			// the StoredModels type widens them to ProviderModelConfig for the toggle.
-			next.all as unknown as readonly Model<Api>[],
-			() => {
-				stored.all = next.all;
-				stored.free = next.free;
+			async () => {
+				// Online: build the static selector catalog. This is purely local (no
+				// fetch, no credential) — LLM7's selectors never change.
+				const { all, free } = fetchLlm7Catalog();
+				const next = prepare(all, free);
+				fetchedFree = next.free;
+				return next.all;
 			},
+			(next) => {
+				stored.all = next;
+				stored.free = fetchedFree;
+			},
+			stored,
 		);
 	}
 
@@ -146,7 +148,6 @@ export function createLlm7Provider(): Llm7NativeProvider {
 			(stored.all.length > 0 ? stored.all : stored.free) as Llm7Model[],
 		filterModels: (models) =>
 			filterNativeModels(PROVIDER_LLM7, models, {
-				showPaid: getLlm7ShowPaid(),
 				freeModels: stored.free,
 			}),
 		refreshModels,

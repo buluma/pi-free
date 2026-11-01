@@ -50,12 +50,6 @@ export async function fetchKiloBalance(token: string): Promise<number | null> {
 	}
 }
 
-export function formatCredits(balance: number): string {
-	return balance >= 1000
-		? `$${(balance / 1000).toFixed(1)}k`
-		: `$${balance.toFixed(2)}`;
-}
-
 // =============================================================================
 // Device auth
 // =============================================================================
@@ -200,7 +194,10 @@ export async function refreshKiloCredential(
 /**
  * Resolve the effective Kilo API key: a natively-stored key (from
  * `interaction.prompt` login) wins, then the ambient `KILO_API_KEY` env var /
- * `~/.pi/free.json` value via the shared config getter.
+ * `~/.pi/free.json` value via the shared config getter. When neither exists,
+ * resolve() returns undefined and Pi hides the provider from /model (#530):
+ * chat requires a real key or OAuth login — the gateway rejects
+ * unauthenticated completions — so a logged-out listing is clutter.
  */
 async function resolveKiloApiKey(input: {
 	ctx: AuthContext;
@@ -208,7 +205,9 @@ async function resolveKiloApiKey(input: {
 	signal?: AbortSignal;
 }): Promise<AuthResult | undefined> {
 	const key = input.credential?.key ?? getKiloApiKey();
-	if (!key) return undefined;
+	if (!key) {
+		return undefined;
+	}
 	return {
 		auth: { apiKey: key },
 		source: input.credential?.key ? "stored API key" : "KILO_API_KEY",

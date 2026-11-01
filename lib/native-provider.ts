@@ -1,40 +1,64 @@
-import {
-	openAICompletionsApi,
-	type Api,
-	type ApiKeyAuth,
-	type ApiKeyCredential,
-	type AuthContext,
-	type AuthInteraction,
-	type AuthResult,
-	type Credential,
-	type Model,
-	type Provider,
-	type ProviderAuth,
-	type RefreshModelsContext,
+import type {
+	Api,
+	ApiKeyAuth,
+	ApiKeyCredential,
+	AuthContext,
+	AuthInteraction,
+	AuthResult,
+	Credential,
+	Model,
+	Provider,
+	ProviderAuth,
+	ProviderStreams,
+	RefreshModelsContext,
 } from "@earendil-works/pi-ai/compat";
 import type {
 	ExtensionAPI,
+	ExtensionContext,
 	ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent";
-import { applyHidden, saveConfig } from "../config.ts";
-import { createLogger } from "./logger.ts";
+import type { ChatModelConfig } from "./types.ts";
 import {
-	getGlobalFreeOnly,
-	getGlobalFreeOnlyForced,
+	applyHidden,
+	isOhMyPiCompat,
+	toggleModelViewOverride,
+} from "../config.ts";
+import { createLogger } from "./logger.ts";
+import { isStaleContextError } from "./stale-ctx.ts";
+import {
 	isFreeModel,
 	registerWithGlobalToggle,
+	resolveModelView,
 } from "./registry.ts";
 import {
 	trackDetachedSessionStart,
 	wrapSessionStartHandler,
 } from "./session-start-metrics.ts";
 import type { ProviderProbe } from "./provider-probe.ts";
+import { lazyOpenAICompletionsApi } from "./lazy-compat.ts";
 import { enhanceWithCI, type StoredModels } from "../provider-helper.ts";
+import {
+	getStartupSummary,
+	recordNativeAbort,
+	recordNativeEmptyRetain,
+	recordNativeRefreshOk,
+	recordNativeRestored,
+} from "./startup-timing.ts";
 
 const _logger = createLogger("native-provider");
 
+/**
+ * Store entries older than this are flagged stale on restore (Mn2, #437).
+ * A 7-day threshold catches long-idle sessions without nagging on normal
+ * 4h-throttled refreshes.
+ */
+const STALE_STORE_WARN_MS = 7 * 24 * 60 * 60 * 1000;
+
+/** Providers that already emitted their one-time stale-store warn (Mn2). */
+const _staleWarnedProviders = new Set<string>();
+
 /** Compatibility bridge for the native single-argument registrar. */
-export type NativeRegistrar = {
+type NativeRegistrar = {
 	registerProvider(provider: Provider): void;
 };
 
@@ -62,8 +86,16 @@ export function createNativeApiKeyAuth(
 			ctx: AuthContext;
 			credential?: ApiKeyCredential;
 		}): Promise<AuthResult | undefined> {
+			// No anonymous fallback: without a stored credential or ambient
+			// key, resolve() returns undefined and Pi hides the provider
+			// from /model (#530). A visible-but-unchattable catalog is
+			// clutter, not discovery — chat needs a key everywhere except
+			// the allowlisted keyless providers (cline, fastrouter, llm7),
+			// which carry their own resolvers.
 			const key = input.credential?.key ?? options.getApiKey();
-			if (!key) return undefined;
+			if (!key) {
+				return undefined;
+			}
 			return {
 				auth: { apiKey: key },
 				source: input.credential?.key ? "stored API key" : options.source,
@@ -80,9 +112,7 @@ export interface NativeOpenAIProviderOptions {
 	auth: ProviderAuth;
 	getApiKey: () => string | undefined;
 	getShowPaid: () => boolean;
-	/** Override the persisted mode for providers whose legacy default is paid. */
-	initialShowPaid?: boolean;
-	initialModels?: ProviderModelConfig[];
+	initialModels?: ProviderModelConfig[] | undefined;
 	fetchModels: (
 		apiKey: string,
 		signal?: AbortSignal,
@@ -91,6 +121,22 @@ export interface NativeOpenAIProviderOptions {
 	allowUnauthenticated?: boolean;
 	tosUrl?: string;
 	suppressTosWhenKey?: boolean;
+	/**
+	 * Optional stream override. Defaults to the shared lazy pi-ai bridge;
+	 * providers with scoped streaming needs (e.g. a retry wrapper) pass their
+	 * own thin wrapper built on that bridge. The compat entry point is still
+	 * only ever loaded lazily through `lib/lazy-compat.ts`.
+	 */
+	streams?: ProviderStreams;
+	/**
+	 * Optional per-model wire-protocol override. Defaults to
+	 * "openai-completions" for every model. Gateways serving some models over
+	 * a different transport (e.g. CommandCode's claude-* models speak
+	 * Anthropic Messages) return the right Api here; pair with a `streams`
+	 * override whose implementations dispatch on `model.api` so the wire
+	 * transport matches what each model was published with.
+	 */
+	apiForModel?: (modelId: string) => Api;
 }
 
 export interface NativeOpenAIProviderHandle {
@@ -109,38 +155,76 @@ function nativeCredentialToken(
 	return getApiKey();
 }
 
+/**
+ * Stamp gateway-safe compat on a native model.
+ *
+ * pi-ai defaults unknown providers to OpenAI's `developer` system-role
+ * convention for reasoning models, but the aggregating gateways pi-free
+ * registers forward it verbatim to upstreams that reject it — TokenRouter
+ * answers with a wrapped `422 openai_error / bad_response_status_code` and
+ * ZenMux with `400: developer is not one of ['system'...]` (both reproduced
+ * live against Qwen-family models). `system` is universally accepted, so
+ * every OpenAI-compatible model pi-free publishes opts out of the developer
+ * role. Existing compat overrides are preserved.
+ */
+export function withGatewayCompat<
+	T extends { compat?: ChatModelConfig["compat"] },
+>(model: T): T {
+	return {
+		...model,
+		compat: { ...model.compat, supportsDeveloperRole: false },
+	};
+}
+
 function toNativeOpenAIModel(
 	model: ProviderModelConfig,
 	providerId: string,
 	baseUrl: string,
-): Model<"openai-completions"> {
-	return {
+	apiForModel?: (modelId: string) => Api,
+): Model<Api> {
+	// SAFETY: the historical Model<"openai-completions"> nominal claim widens
+	// to Model<Api>: when apiForModel overrides the transport (e.g.
+	// anthropic-messages for CommandCode's claude-* models) the runtime object
+	// carries the right Api and the provider's streams override must dispatch
+	// on model.api. Call sites filing results into openai-completions-typed
+	// stores cast deliberately - pi-ai reads the runtime api field, never the
+	// compile-time type parameter.
+	const api = apiForModel?.(model.id) ?? "openai-completions";
+	// SAFETY: widening cast — pi-ai reads the runtime api field set above,
+	// never this function's compile-time return parameter.
+	return withGatewayCompat({
 		...model,
-		api: "openai-completions",
+		api,
 		provider: providerId,
 		baseUrl,
-	} as Model<"openai-completions">;
+	} as unknown as Model<Api>);
 }
 
-/** Apply the shared global/provider free-model policy to a complete native catalog. */
+/**
+ * Apply the effective catalog view to a complete native catalog. The view
+ * resolves live (explicit per-provider choice, else the global default),
+ * so registration-time values can never go stale across sessions (#510).
+ * `forceFree` survives as the single escape hatch for provider-level
+ * free-only flags (e.g. kilo's own `kilo_free_only`).
+ */
 export function filterNativeModels<T extends Model<Api>>(
 	providerId: string,
 	models: readonly T[],
 	options: {
-		showPaid: boolean;
 		freeModels: readonly ProviderModelConfig[];
 		forceFree?: boolean;
 	},
 ): readonly T[] {
-	const forceFree =
-		options.forceFree === true ||
-		(typeof getGlobalFreeOnlyForced === "function" &&
-			getGlobalFreeOnlyForced());
-	const freeOnly = getGlobalFreeOnly() && (forceFree || !options.showPaid);
+	const freeOnly =
+		options.forceFree === true || resolveModelView(providerId) === "free";
 	const freeIds = new Set(options.freeModels.map((model) => model.id));
 	const visible = freeOnly
 		? models.filter((model) => freeIds.has(model.id))
 		: models;
+	// SAFETY: T extends Model<Api> (declared on the function), and every Model
+	// carries the same fields as ProviderModelConfig plus provider/api/baseUrl.
+	// applyHidden is a plain passthrough filter on shared fields, so the cast
+	// is read-only and cannot widen/corrupt the object shape.
 	return applyHidden(
 		visible as unknown as ProviderModelConfig[],
 		providerId,
@@ -151,9 +235,13 @@ export function filterNativeModels<T extends Model<Api>>(
 export function createNativeOpenAIProvider(
 	options: NativeOpenAIProviderOptions,
 ): NativeOpenAIProviderHandle {
-	const streams = openAICompletionsApi();
+	const streams = options.streams ?? lazyOpenAICompletionsApi();
 	const stored: StoredModels = { free: [], all: [] };
-	let showPaidOverride = options.initialShowPaid;
+	// In-session override only; starts undefined so the persisted config
+	// getter (options.getShowPaid) is authoritative on startup. `setShowPaid`
+	// records the live value while the toggle is running, but it must never
+	// seed the boot state or a persisted toggle would be lost on restart.
+	let showPaidOverride: boolean | undefined;
 
 	function classifyFree(
 		models: Model<"openai-completions">[],
@@ -168,7 +256,7 @@ export function createNativeOpenAIProvider(
 	}
 
 	function setShowPaid(next: boolean): void {
-		if (options.initialShowPaid !== undefined) showPaidOverride = next;
+		showPaidOverride = next;
 	}
 
 	function ingest(
@@ -176,29 +264,52 @@ export function createNativeOpenAIProvider(
 		free: ProviderModelConfig[],
 	): void {
 		stored.all = enhanceWithCI(all, options.providerId).map((model) =>
-			toNativeOpenAIModel(model, options.providerId, options.baseUrl),
+			toNativeOpenAIModel(
+				model,
+				options.providerId,
+				options.baseUrl,
+				options.apiForModel,
+			),
 		);
 		stored.free = enhanceWithCI(free, options.providerId).map((model) =>
-			toNativeOpenAIModel(model, options.providerId, options.baseUrl),
+			toNativeOpenAIModel(
+				model,
+				options.providerId,
+				options.baseUrl,
+				options.apiForModel,
+			),
 		);
 	}
 
 	const initialModels = options.initialModels ?? [];
 	if (initialModels.length > 0) {
 		const all = enhanceWithCI(initialModels, options.providerId).map((model) =>
-			toNativeOpenAIModel(model, options.providerId, options.baseUrl),
+			toNativeOpenAIModel(
+				model,
+				options.providerId,
+				options.baseUrl,
+				options.apiForModel,
+			),
 		);
 		stored.all = all;
-		stored.free = classifyFree(all);
+		// SAFETY: classification only reads id/name/cost fields; per-model
+		// transports (apiForModel) widen the nominal type parameter only.
+		stored.free = classifyFree(all as Model<"openai-completions">[]);
 	}
 
 	async function refreshModels(context: RefreshModelsContext): Promise<void> {
-		await refreshNativeProviderModels(
+		// SAFETY: per-model transports (apiForModel) widen elements to
+		// Model<Api>; stored fields are ProviderModelConfig-shaped and pi-ai
+		// dispatches on the runtime api field, so the casts below only relax a
+		// nominal type parameter that no longer fits dual-transport providers.
+		await refreshNativeProviderModels<Model<Api>>(
 			options.providerId,
 			context,
-			(storedModels: Model<"openai-completions">[]) => {
+			(storedModels) => {
 				stored.all = storedModels;
-				stored.free = classifyFree(storedModels);
+				stored.free = classifyFree(
+					storedModels as Model<"openai-completions">[],
+				);
 			},
 			async () => {
 				const token = nativeCredentialToken(
@@ -208,13 +319,19 @@ export function createNativeOpenAIProvider(
 				if (!token && !options.allowUnauthenticated) return [];
 				const all = await options.fetchModels(token ?? "", context.signal);
 				return enhanceWithCI(all, options.providerId).map((model) =>
-					toNativeOpenAIModel(model, options.providerId, options.baseUrl),
+					toNativeOpenAIModel(
+						model,
+						options.providerId,
+						options.baseUrl,
+						options.apiForModel,
+					),
 				);
 			},
 			(models) => {
 				stored.all = models;
-				stored.free = classifyFree(models);
+				stored.free = classifyFree(models as Model<"openai-completions">[]);
 			},
+			stored,
 		);
 	}
 
@@ -230,7 +347,6 @@ export function createNativeOpenAIProvider(
 				: stored.free) as Model<"openai-completions">[],
 		filterModels: (models) =>
 			filterNativeModels(options.providerId, models, {
-				showPaid: getShowPaid(),
 				freeModels: stored.free,
 			}),
 		refreshModels,
@@ -269,7 +385,6 @@ export function registerNativeOpenAIProvider(
 	registerNativeProviderToggle(pi, {
 		providerId: options.providerId,
 		stored: handle.stored,
-		getShowPaid: handle.getShowPaid,
 		setShowPaid: handle.setShowPaid,
 		reRegister,
 	});
@@ -332,21 +447,198 @@ export function registerNativeAvailabilityProbe(
 	);
 }
 
-/** Register a native provider across the current dev snapshot and >=0.81 peers. */
+/**
+ * Compatibility bridge for hosts like Oh My Pi (`omp`) or earlier Pi runtimes
+ * that only implement the two-argument signature:
+ *   registerProvider(name: string, config: ProviderConfig): void
+ *
+ * Only used when {@link shouldUseLegacyProviderBridge} opts in (see below).
+ *
+ * SAFETY: every `as any` below touches the legacy host's undocumented
+ * registration surface, which has no shared types in this repo. Each cast
+ * is confined to reading one optional field or forwarding one callback;
+ * nothing is written back into the native Provider object.
+ */
+export function registerLegacyProviderFromNative(
+	pi: ExtensionAPI,
+	provider: Provider,
+): void {
+	const id = provider.id;
+	const models = [...provider.getModels()];
+
+	// 1. OAuth bridge: adapt native AuthInteraction login/refresh to OMP callbacks
+	let oauth: Record<string, unknown> | undefined;
+	const nativeOAuth = (provider.auth as any)?.oauth;
+	if (nativeOAuth) {
+		oauth = {
+			name: nativeOAuth.name ?? provider.name ?? id,
+			login: async (callbacks: any) => {
+				if (typeof nativeOAuth.login === "function") {
+					const interaction = {
+						signal: callbacks?.signal,
+						notify: (ev: any) => {
+							if (ev.type === "auth_url") {
+								callbacks?.onAuth?.({
+									url: ev.url,
+									instructions: ev.instructions,
+								});
+							} else if (ev.type === "device_code") {
+								callbacks?.onDeviceCode?.(ev);
+							} else if (ev.type === "progress") {
+								callbacks?.onProgress?.(ev.message);
+							}
+						},
+						prompt: async (p: any) => {
+							if (p.type === "manual_code" && callbacks?.onManualCodeInput) {
+								return callbacks.onManualCodeInput();
+							}
+							if (p.type === "select" && callbacks?.onSelect) {
+								return callbacks.onSelect(p);
+							}
+							if (callbacks?.onPrompt) {
+								return callbacks.onPrompt({
+									message: p.message,
+									defaultValue: p.placeholder,
+								});
+							}
+							return "";
+						},
+					};
+					return await nativeOAuth.login(interaction);
+				}
+				return {};
+			},
+			refreshToken: async (credentials: any) => {
+				if (typeof nativeOAuth.refresh === "function") {
+					return await nativeOAuth.refresh(credentials);
+				}
+				return credentials;
+			},
+			getApiKey: (credentials: any) => {
+				// 1. If access token is already a string on credentials, return it synchronously
+				if (typeof credentials?.access === "string") {
+					return credentials.access;
+				}
+				// 2. Fall back to calling toAuth synchronously if it isn't a promise
+				if (typeof nativeOAuth.toAuth === "function") {
+					const authRes = nativeOAuth.toAuth(credentials);
+					if (authRes && typeof authRes.then !== "function") {
+						return authRes?.apiKey ?? credentials?.access;
+					}
+				}
+				return credentials?.access;
+			},
+		};
+	}
+
+	// 2. API Key resolution
+	let apiKey: string | undefined;
+	const nativeApiKey = (provider.auth as any)?.apiKey;
+	if (nativeApiKey && typeof nativeApiKey.getApiKey === "function") {
+		apiKey = nativeApiKey.getApiKey();
+	}
+	if (!apiKey && typeof (provider.auth as any)?.getApiKey === "function") {
+		apiKey = (provider.auth as any).getApiKey();
+	}
+
+	// In OMP runtime registration:
+	// If models has elements, OMP requires apiKey or oauthConfigured: Boolean(oauth).
+	// If neither is present, OMP throws. In that case, if models are present but unauthenticated,
+	// provide an inert sentinel so OMP registers the catalog. This value only
+	// satisfies OMP's registration gate — real auth flows through `oauth` or
+	// `apiKey` above when present. Whether OMP ever transmits the sentinel
+	// upstream is unverified on a live host: never put a real credential here.
+	const effectiveApiKey =
+		apiKey ||
+		(oauth ? undefined : models.length > 0 ? "placeholder" : undefined);
+
+	const config: Record<string, unknown> = {
+		name: provider.name ?? id,
+		baseUrl: provider.baseUrl ?? "",
+		api: "openai-completions",
+		headers: provider.headers ?? undefined,
+		models,
+		...(effectiveApiKey ? { apiKey: effectiveApiKey } : {}),
+		...(oauth ? { oauth } : {}),
+	};
+
+	if (typeof provider.refreshModels === "function") {
+		config.fetchDynamicModels = async () => {
+			try {
+				await provider.refreshModels?.({
+					allowNetwork: true,
+					signal: AbortSignal.timeout(15000),
+					publish: async (pub) => {
+						pub.update?.();
+						return true;
+					},
+				});
+				return provider.getModels();
+			} catch {
+				return provider.getModels();
+			}
+		};
+	}
+
+	(pi.registerProvider as any)(id, config);
+}
+
+/**
+ * Whether this host needs the legacy two-argument provider bridge.
+ *
+ * Decision order (first match wins):
+ *
+ * 1. Explicit override — `oh_my_pi_compat` in `~/.pi/free.json` (or
+ *    `OH_MY_PI_COMPAT=1`) forces the bridge, e.g. for OMP API drift or
+ *    other legacy-only hosts.
+ * 2. Native capability — a host exposing `registerNativeProvider` speaks
+ *    native Provider objects; the bridge is never needed there.
+ * 3. Auto-detect — Oh My Pi exposes a legacy-only two-argument
+ *    `registerProvider(name, config)` plus OMP-specific API members. Both
+ *    markers below are verified against can1357/oh-my-pi
+ *    (`packages/coding-agent/src/extensibility/extensions/types.ts`:
+ *    `registerFileWriteFallback`, injected `arktype` shim) and both are
+ *    absent from the installed stock-Pi bundle, so an unknown future host
+ *    falls through to the native default instead of being misrouted.
+ *
+ * Deliberately NOT based on `Function.length`: stock Pi's extension-facing
+ * `registerProvider(providerOrName, config)` overload also has `.length 2`
+ * (it dispatches on `typeof providerOrName`), so an arity check routes the
+ * standard host down the legacy path — the exact regression this guard
+ * exists to prevent. Exported so the rule is unit-tested directly.
+ */
+export function shouldUseLegacyProviderBridge(pi: ExtensionAPI): boolean {
+	if (isOhMyPiCompat()) return true;
+	// SAFETY: capability probes only — read optional members off the host
+	// object; no calls, no writes, no behavioral assumptions beyond presence.
+	const maybeNative = pi as unknown as {
+		registerNativeProvider?: unknown;
+	};
+	if (typeof maybeNative.registerNativeProvider === "function") return false;
+	return "registerFileWriteFallback" in pi && "arktype" in pi;
+}
+
+/** Register a native provider across the current dev snapshot, >=0.81 peers, and Oh My Pi (omp). */
 export function registerNativeProvider(
 	pi: ExtensionAPI,
 	provider: Provider,
 ): void {
+	if (shouldUseLegacyProviderBridge(pi)) {
+		// Host expects the legacy (name, config) form — bridge to it.
+		registerLegacyProviderFromNative(pi, provider);
+		return;
+	}
+
+	// SAFETY: this bridge exists only because the declared peer minimum
+	// registerProvider(provider) single-arg signature is not satisfiable with
+	// the pinned dev snapshot's ExtensionAPI. Provider is the exact runtime
+	// value pi-ai expects; the cast changes no data, only the nominal type.
 	(pi as unknown as NativeRegistrar).registerProvider(provider);
 }
 
 interface NativeToggleOptions {
 	providerId: string;
-	stored: {
-		free: ProviderModelConfig[];
-		all: ProviderModelConfig[];
-	};
-	getShowPaid: () => boolean;
+	stored: StoredModels;
 	setShowPaid?: (showPaid: boolean) => void;
 	reRegister: () => void;
 }
@@ -356,27 +648,41 @@ export function registerNativeProviderToggle(
 	pi: ExtensionAPI,
 	options: NativeToggleOptions,
 ): void {
-	const { providerId, stored, getShowPaid, reRegister } = options;
+	const { providerId, stored, reRegister } = options;
 
 	pi.registerCommand(`toggle-${providerId}`, {
 		description: `Toggle between free and all ${providerId} models`,
 		handler: async (_args, ctx) => {
-			const showPaid = !getShowPaid();
-			await saveConfig({ [`${providerId}_show_paid`]: showPaid });
+			// Flip the EFFECTIVE view atomically (resolve + flip + persist in
+			// one locked read-modify-write), so two rapid toggles cannot read
+			// the same pre-write state and collapse (#603). Persisted under
+			// the provider id, so the old divergent snake_case keys
+			// (e.g. ollama-cloud → ollama_show_paid) are gone; a legacy
+			// explicit `true` still counts as "all".
+			const next = await toggleModelViewOverride(providerId);
+			const showPaid = next === "all";
 			options.setShowPaid?.(showPaid);
 
 			reRegister();
 
+			// stored.all may still be the restored subset (complete is set
+			// only by a network publication): never present subset counts
+			// as catalog totals (TLC ToggleB NoSubsetAsAll).
+			const complete = stored.complete === true;
 			const freeCount = stored.free.length;
 			const paidCount = stored.all.length - freeCount;
 			if (showPaid && stored.all.length > 0) {
 				ctx.ui.notify(
-					`${providerId}: showing all ${stored.all.length} models (${freeCount} free, ${paidCount} paid)`,
+					complete
+						? `${providerId}: showing all ${stored.all.length} models (${freeCount} free, ${paidCount} paid)`
+						: `${providerId}: showing ${stored.all.length} restored models (full catalog not yet fetched; paid count unknown)`,
 					"info",
 				);
 			} else {
 				ctx.ui.notify(
-					`${providerId}: showing ${freeCount} free models (${paidCount} paid hidden)`,
+					complete
+						? `${providerId}: showing ${freeCount} free models (${paidCount} paid hidden)`
+						: `${providerId}: showing ${freeCount} restored free models (full catalog not yet fetched)`,
 					"info",
 				);
 			}
@@ -385,12 +691,84 @@ export function registerNativeProviderToggle(
 }
 
 /**
- * Nudge Pi's native model refresh once per extension session.
+ * Backoff schedule for refresh attempts after the initial nudge.
+ * TLC model RefreshB (tla/RefreshB.cfg): 1 initial + 3 retries exhaust
+ * a storm budget of 3 adversarial re-registers; further attempts would only
+ * repeat the same race, so the nudge then stands down loudly and the next
+ * session_start tries again with a fresh budget.
+ */
+const NUDGE_RETRY_DELAYS_MS = [5_000, 15_000, 30_000];
+
+/**
+ * Nudge epoch: bumped on every session_start. A pending retry whose epoch
+ * no longer matches belongs to a previous runner (a reload creates a new
+ * runner while the old timer is still in flight in the same process) and
+ * must stand down — otherwise the obsolete retry's scoped refresh
+ * supersedes the new nudge's generations and both abort each other.
+ */
+let nudgeEpoch = 0;
+
+/** Fallback nonce so an unreadable ledger reads as "no progress" (retry
+ * direction), never as false completion. getStartupSummary is pure
+ * in-memory and never throws in practice. */
+let completionSnapshotNonce = 0;
+
+/**
+ * Completion stamp per in-scope provider: refresh-ok and empty-retain
+ * counters from the startup-timing ledger. A provider whose stamp is
+ * unchanged across a refresh() call published nothing — Pi swallows
+ * per-provider aborts, so a clean result alone proves nothing (TLC
+ * NoFalseClean). An empty-retain counts as completion: the provider ran a
+ * full network generation and genuinely found nothing (e.g. no token).
+ */
+function nativeCompletionSnapshot(ids: readonly string[]): Map<string, string> {
+	try {
+		const entries = getStartupSummary().cacheNetwork;
+		const known = new Map(entries.map((entry) => [entry.provider, entry]));
+		return new Map(
+			ids.map((id) => {
+				const entry = known.get(id);
+				return [id, `${entry?.refreshOks ?? 0}:${entry?.emptyRetains ?? 0}`];
+			}),
+		);
+	} catch {
+		return new Map(
+			ids.map((id) => [id, `unknown-${completionSnapshotNonce++}`]),
+		);
+	}
+}
+
+/**
+ * Provider ids that asked for the session-start refresh nudge. The nudge
+ * refreshes exactly these (never the whole registry): tiers Pi owns
+ * outright (opencode-free/go, openrouter) never register here, so their
+ * credential failures (e.g. a missing OPENCODE_API_KEY) cannot fail a
+ * refresh that is none of their business. A Set (not the global
+ * registry) keeps the scope on providers that opted in, with no coupling
+ * to registration order.
+ */
+const nudgeProviderIds = new Set<string>();
+
+/**
+ * Nudge Pi's model refresh once per extension session, scoped to the
+ * opted-in providers.
  *
- * Pi 0.84 supersedes an in-flight refresh for each provider when a newer
- * refresh starts. Registering this handler once per provider while calling a
- * global refresh caused every handler to abort the previous providers' fetches
- * in a tight loop on session resume.
+ * Two hard-won constraints shape this:
+ *
+ * - Pi supersedes an in-flight refresh per provider when a newer refresh
+ *   begins — and every registerProvider/unregister fires a global offline
+ *   refresh. pi-free's own session-start captures re-register providers
+ *   ~40ms after this nudge fires, so an unscoped, unretried network
+ *   refresh is deterministically aborted before slow fetches land (empty
+ *   catalog on fresh installs). The nudge therefore retries once when
+ *   aborted, after the re-registration storm has settled.
+ * - Pi reports per-provider errors for the WHOLE registry, including
+ *   tiers pi-free does not refresh (missing OPENCODE_API_KEY). Only
+ *   errors for the scoped ids fail this nudge; anything else is noise.
+ *
+ * Registering this handler once per provider while calling a global
+ * refresh caused every handler to abort the previous providers' fetches
+ * in a tight loop on session resume (kept: the WeakSet guard below).
  */
 const nativeRefreshRegistrations = new WeakSet<object>();
 
@@ -398,48 +776,130 @@ export function registerNativeProviderRefresh(
 	pi: ExtensionAPI,
 	providerId: string,
 ): void {
+	// The opt-in id must land before the once-per-runner guard below: every
+	// provider registers through here on the same `pi`, so returning early
+	// before adding would leave only the first provider (kilo) in the nudge
+	// scope and every other catalog (e.g. zenmux) stale forever (#551). The
+	// guard still ensures a single session_start handler per runner.
+	nudgeProviderIds.add(providerId);
 	if (nativeRefreshRegistrations.has(pi as object)) return;
 	nativeRefreshRegistrations.add(pi as object);
 
 	pi.on(
 		"session_start",
-		wrapSessionStartHandler(providerId, (_event, ctx) => {
-			try {
-				const registry = (
-					ctx as {
-						modelRegistry?: { refresh?: (opts?: unknown) => unknown };
-					}
-				).modelRegistry;
-				const result = registry?.refresh?.({ allowNetwork: true });
-				if (
-					result &&
-					typeof (result as PromiseLike<unknown>).then === "function"
-				) {
-					const refreshTask = Promise.resolve(result).then((value) => {
-						const errors = (value as { errors?: { size?: number } } | undefined)
-							?.errors;
-						if (errors?.size && errors.size > 0) {
-							throw new Error(
-								`Pi model refresh reported ${errors.size} provider error(s)`,
-							);
-						}
-					});
-					trackDetachedSessionStart(
-						`${providerId}-model-refresh`,
-						refreshTask,
-						(err) => logRefreshFailure(providerId, err),
-					);
-				}
-			} catch (err) {
-				logRefreshFailure(providerId, err);
-			}
+		wrapSessionStartHandler("native-model-refresh", (_event, ctx) => {
+			const epoch = ++nudgeEpoch;
+			void runRefreshNudge(ctx, epoch, 0);
 			return Promise.resolve();
 		}),
 	);
 }
 
-function logRefreshFailure(providerId: string, error: unknown): void {
-	_logger.warn(`Model refresh nudge failed for ${providerId}`, {
+async function runRefreshNudge(
+	ctx: ExtensionContext,
+	epoch: number,
+	attempt: number,
+): Promise<void> {
+	// A newer session started while we were queued: its nudge owns refresh now.
+	if (epoch !== nudgeEpoch) return;
+	try {
+		if (nudgeProviderIds.size === 0) {
+			_logger.debug(
+				"[native-model-refresh] no providers opted in; skipping nudge",
+			);
+			return;
+		}
+		const scopedIds = [...nudgeProviderIds];
+		const before = nativeCompletionSnapshot(scopedIds);
+		const result = await ctx.modelRegistry?.refresh?.({
+			allowNetwork: true,
+			providers: scopedIds,
+		});
+		// A newer session started mid-refresh: its nudge owns the next attempt.
+		if (epoch !== nudgeEpoch) return;
+		if (!result) {
+			_logger.debug(
+				"[native-model-refresh] registry refresh unavailable; skipping nudge",
+			);
+			return;
+		}
+		const ownErrors = [...result.errors].filter(([id]) =>
+			nudgeProviderIds.has(id),
+		);
+		if (ownErrors.length > 0) {
+			throw new Error(
+				`Pi model refresh reported ${ownErrors.length} pi-free provider error(s): ` +
+					ownErrors
+						.map(([id, error]) => `${id} :: ${error.message}`)
+						.join(" | "),
+			);
+		}
+		// Pi swallows per-provider aborts, so a clean result is not proof
+		// that anything published: retry while scoped providers show no
+		// completion stamp (TLC RefreshB).
+		const after = nativeCompletionSnapshot(scopedIds);
+		const incomplete = scopedIds.filter(
+			(id) => after.get(id) === before.get(id),
+		);
+		if (incomplete.length === 0) {
+			trackDetachedSessionStart(
+				"native-model-refresh",
+				Promise.resolve(),
+				undefined,
+			);
+			_logger.debug(
+				`[native-model-refresh] refreshed ${scopedIds.length} provider(s) clean`,
+			);
+			return;
+		}
+		if (attempt >= NUDGE_RETRY_DELAYS_MS.length) {
+			_logger.warn(
+				"[native-model-refresh] refresh incomplete; catalogs stay as-is until the next refresh",
+				{ providers: incomplete },
+			);
+			return;
+		}
+		if (result.aborted) {
+			_logger.info(
+				"[native-model-refresh] refresh superseded; retrying with backoff",
+				{ attempt: attempt + 1, providers: incomplete },
+			);
+		} else {
+			_logger.info(
+				"[native-model-refresh] refresh published nothing; retrying with backoff",
+				{ attempt: attempt + 1, providers: incomplete },
+			);
+		}
+		const delay = NUDGE_RETRY_DELAYS_MS[attempt] ?? 30_000;
+		setTimeout(() => {
+			// Obsolete retry from a previous runner: the current epoch's
+			// nudge owns refresh; firing would abort its generations.
+			if (epoch !== nudgeEpoch) return;
+			trackDetachedSessionStart(
+				`native-model-refresh-retry-${attempt + 1}`,
+				runRefreshNudge(ctx, epoch, attempt + 1),
+				(err) => logRefreshFailure(err),
+			);
+		}, delay);
+		return;
+	} catch (err) {
+		// A replaced session invalidates the captured ctx mid-nudge (#509) —
+		// routine, not a warning.
+		if (isStaleContextError(err)) {
+			_logger.info(
+				"[native-model-refresh] session changed mid-nudge; dropping",
+				{
+					error: err instanceof Error ? err.message : String(err),
+				},
+			);
+			return;
+		}
+		logRefreshFailure(err);
+	}
+}
+
+function logRefreshFailure(error: unknown): void {
+	_logger.warn("Model refresh nudge failed", {
 		error: error instanceof Error ? error.message : String(error),
 	});
 }
@@ -458,7 +918,7 @@ type NativeRefreshContext = {
 	/** Pi 0.84+ generation-checked publication API. */
 	publish?: (publication: {
 		persist?: NativeModelsStoreEntry | null;
-		update?: () => void;
+		update?: (() => void) | undefined;
 	}) => Promise<boolean>;
 	/** Pi <=0.83 legacy provider store. */
 	store?: {
@@ -470,6 +930,9 @@ type NativeRefreshContext = {
 function getNativeRefreshContext(
 	context: RefreshModelsContext,
 ): NativeRefreshContext {
+	// SAFETY: NativeRefreshContext is a superset of RefreshModelsContext (the
+	// published/stored fields are optional on both), so the cast only lets
+	// callers read the extra optional fields; it never fabricates data.
 	return context as unknown as NativeRefreshContext;
 }
 
@@ -490,9 +953,35 @@ export async function restoreNativeProviderModels<T extends Model<Api>>(
 		const entry = usesNativePublication(context)
 			? nativeContext.stored
 			: await nativeContext.store?.read();
-		const models = (entry?.models ?? []).filter(
+		const restored = (entry?.models ?? []).filter(
 			(model) => model.provider === providerId,
-		) as T[];
+		);
+		// Restored entries may predate the gateway-compat stamp (written by an
+		// older build); re-stamp so the offline window before the next refresh
+		// still sends `system` instead of `developer`.
+		const models = restored.map((model) => withGatewayCompat(model)) as T[];
+		if (entry) {
+			// M1: a store restore happened (even with 0 models — that is how
+			// "refresh ok with 0 models" is later distinguished from "never ran").
+			const storeAgeMs =
+				typeof entry.checkedAt === "number"
+					? Date.now() - entry.checkedAt
+					: undefined;
+			recordNativeRestored(providerId, storeAgeMs);
+			// Mn2: warn once per provider when the restored entry is stale.
+			if (
+				storeAgeMs !== undefined &&
+				storeAgeMs > STALE_STORE_WARN_MS &&
+				!_staleWarnedProviders.has(providerId)
+			) {
+				_staleWarnedProviders.add(providerId);
+				_logger.warn(`Stale ${providerId} models store`, {
+					ageMs: Math.round(storeAgeMs),
+					ageDays: Number((storeAgeMs / (24 * 60 * 60 * 1000)).toFixed(1)),
+					modelCount: models.length,
+				});
+			}
+		}
 		if (models.length > 0) onModels(models);
 	} catch (err) {
 		_logger.warn(
@@ -504,41 +993,127 @@ export async function restoreNativeProviderModels<T extends Model<Api>>(
 	}
 }
 
-/** Refresh, publish, and persist a native provider catalog. */
+/** Refresh, publish, and persist a native provider catalog.
+ *
+ * `stored`, when passed, receives the completeness flag the toggle
+ * notifies on: `false` when a restore publishes a possibly-partial
+ * subset, `true` once a network generation publishes the complete
+ * catalog. Centralized here so bespoke callers cannot forget it (#609);
+ * every provider's `stored` is the same `StoredModels` record the toggle
+ * reads.
+ */
 export async function refreshNativeProviderModels<T extends Model<Api>>(
 	providerId: string,
 	context: RefreshModelsContext,
 	onRestore: (models: T[]) => void,
 	fetchModels: () => Promise<T[]>,
 	onFetched: (models: T[]) => void,
+	stored?: StoredModels,
 ): Promise<void> {
-	await restoreNativeProviderModels(providerId, context, onRestore);
-	if (!context.allowNetwork || context.signal?.aborted) return;
+	await restoreNativeProviderModels<T>(providerId, context, (models) => {
+		// A restore is a fallback for a catalog no network generation has
+		// published yet, never a downgrade of one that has. Pi fires a global
+		// allowNetwork:false refresh on every registerProvider
+		// (model-runtime.registerNativeProvider), and the store snapshot it
+		// carries is whatever the last persist wrote — under a free view that
+		// is the view-filtered subset (#519), e.g. 1 of 92. Applying it would
+		// collapse the complete in-session catalog the moment any toggle /
+		// hide re-registers the provider, so the "all" view the user just
+		// selected would offer the free subset instead of the paid catalog.
+		if (stored?.complete === true) return;
+		// A restore publishes a possibly free-view-only subset, never the
+		// catalog (TLC ToggleB) — mark before delegating so even a
+		// throwing onRestore leaves the safe value.
+		if (stored) stored.complete = false;
+		onRestore(models);
+	});
+	// Offline init (allowNetwork=false) is not an abort: the refresh never ran.
+	if (!context.allowNetwork) return;
+	if (context.signal?.aborted) {
+		// M1: cancellation is expected — count it, never log as an error (#15).
+		recordNativeAbort(providerId);
+		return;
+	}
 
 	try {
 		const models = await fetchModels();
-		if (context.signal?.aborted || models.length === 0) return;
-		await persistNativeProviderModels(providerId, context, models, () =>
-			onFetched(models),
+		if (context.signal?.aborted) {
+			recordNativeAbort(providerId);
+			return;
+		}
+		if (models.length === 0) {
+			// M1: a completed refresh that returned nothing retained the previous
+			// list — recorded so it is distinguishable from "refresh never ran".
+			recordNativeEmptyRetain(providerId);
+			return;
+		}
+		// Persist the EFFECTIVE view, not the complete fetch: under a free
+		// view the store keeps only free models, so Pi's per-refresh
+		// structuredClone + store write (the ~59% startup-CPU sink from
+		// #519) scale with visible models, not the full paid catalog.
+		// In-memory state still takes the complete list via onFetched, so
+		// toggling to all works offline until the next network refresh.
+		const persistModels =
+			resolveModelView(providerId) === "free"
+				? models.filter((model) =>
+						isFreeModel(
+							{ ...model, provider: providerId },
+							models as ProviderModelConfig[],
+						),
+					)
+				: models;
+		_logger.debug(
+			`[${providerId}] persisting ${persistModels.length}/${models.length} models (${resolveModelView(providerId)} view)`,
 		);
+		// Only count as "ok" if persistence actually published: a superseded
+		// generation (publish() returns false — update never ran) or a store
+		// write failure must not inflate the success counter.
+		if (
+			await persistNativeProviderModels(
+				providerId,
+				context,
+				persistModels,
+				() => {
+					// Publication ran, so the complete catalog is live:
+					// mark before delegating, same safe-default order.
+					if (stored) stored.complete = true;
+					onFetched(models);
+				},
+			)
+		) {
+			// Telemetry counts the fetched catalog (refresh productivity),
+			// not the persisted view — the view filter above only shrinks
+			// what hits the disk/network-clone path.
+			recordNativeRefreshOk(providerId, models.length);
+		}
 	} catch (err) {
+		// Pi may abort a superseded refresh; cancellation is not a provider error.
+		if (context.signal?.aborted) {
+			recordNativeAbort(providerId);
+			return;
+		}
 		_logger.warn(`Failed to refresh ${providerId} models; retaining previous`, {
 			error: err instanceof Error ? err.message : String(err),
 		});
 	}
 }
 
-/** Persist a native provider catalog while retaining the previous store on failure. */
+/**
+ * Persist a native provider catalog while retaining the previous store on
+ * failure. Returns true when the catalog was actually published (a superseded
+ * generation, where Pi's publish() returns false and the update never ran,
+ * yields false — callers must not count it as a successful refresh).
+ */
 export async function persistNativeProviderModels(
 	providerId: string,
 	context: RefreshModelsContext,
 	models: readonly Model<Api>[],
 	onPublished?: () => void,
-): Promise<void> {
+): Promise<boolean> {
 	const nativeContext = getNativeRefreshContext(context);
 	try {
 		if (usesNativePublication(context) && nativeContext.publish) {
-			await nativeContext.publish({
+			const published = await nativeContext.publish({
 				persist: {
 					models,
 					checkedAt: Date.now(),
@@ -546,7 +1121,7 @@ export async function persistNativeProviderModels(
 				// Pi runs this only if this refresh generation is still current.
 				update: onPublished,
 			});
-			return;
+			return published !== false;
 		}
 
 		onPublished?.();
@@ -554,9 +1129,11 @@ export async function persistNativeProviderModels(
 			models,
 			checkedAt: Date.now(),
 		});
+		return true;
 	} catch (err) {
 		_logger.warn(`Failed to persist ${providerId} models to store`, {
 			error: err instanceof Error ? err.message : String(err),
 		});
+		return false;
 	}
 }

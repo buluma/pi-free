@@ -6,10 +6,6 @@
  * notice, and the session_start refresh nudge.
  */
 
-import type {
-	ModelsStoreEntry,
-	ProviderModelsStore,
-} from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -17,6 +13,10 @@ const mockGetLlm7ApiKey = vi.hoisted(() =>
 	vi.fn((): string | undefined => undefined),
 );
 const mockGetLlm7ShowPaid = vi.hoisted(() => vi.fn(() => false));
+const mockGetModelViewOverride = vi.hoisted(() =>
+	vi.fn((_providerId: string): "free" | "all" | undefined => undefined),
+);
+const mockSetModelViewOverride = vi.hoisted(() => vi.fn());
 const mockGetGlobalFreeOnly = vi.hoisted(() => vi.fn(() => true));
 const mockSaveConfig = vi.hoisted(() =>
 	vi.fn<(...args: unknown[]) => Promise<void>>(),
@@ -37,6 +37,11 @@ let capturedToggleArgs: unknown[][] = [];
 vi.mock("../config.ts", () => ({
 	getLlm7ApiKey: () => mockGetLlm7ApiKey(),
 	getLlm7ShowPaid: () => mockGetLlm7ShowPaid(),
+	isOhMyPiCompat: () => false,
+	getModelViewOverride: (providerId: string) =>
+		mockGetModelViewOverride(providerId),
+	setModelViewOverride: (...args: unknown[]) =>
+		mockSetModelViewOverride(...args),
 	saveConfig: (...args: unknown[]) => mockSaveConfig(...args),
 	applyHidden: (models: { id: string }[]) => models,
 }));
@@ -47,7 +52,11 @@ vi.mock("../lib/registry.ts", () => ({
 		mockRegisterWithGlobalToggle(...args);
 	},
 	getGlobalFreeOnly: () => mockGetGlobalFreeOnly(),
-	getGlobalFreeOnlyForced: () => false,
+	// Mirrors the real resolveModelView over the mocked config getters (the
+	// real rule is unit-tested in registry-provider-overrides.test.ts).
+	resolveModelView: (providerId: string) =>
+		mockGetModelViewOverride(providerId) ??
+		(mockGetLlm7ShowPaid() ? "all" : mockGetGlobalFreeOnly() ? "free" : "all"),
 	isFreeModel: (m: { cost?: { input?: number } }) => (m.cost?.input ?? 0) === 0,
 }));
 
@@ -64,19 +73,6 @@ vi.mock("../lib/logger.ts", () => ({
 
 import llm7Provider from "../providers/llm7/llm7.ts";
 
-function makeStore(): ProviderModelsStore {
-	let entry: ModelsStoreEntry | undefined;
-	return {
-		read: async () => entry,
-		write: async (e: ModelsStoreEntry) => {
-			entry = e;
-		},
-		delete: async () => {
-			entry = undefined;
-		},
-	};
-}
-
 describe("LLM7 factory wiring", () => {
 	let mockPi: ExtensionAPI;
 	let mockRegisterProvider: ReturnType<typeof vi.fn>;
@@ -88,6 +84,7 @@ describe("LLM7 factory wiring", () => {
 		capturedToggleArgs = [];
 		mockGetLlm7ApiKey.mockReturnValue(undefined);
 		mockGetLlm7ShowPaid.mockReturnValue(false);
+		mockGetModelViewOverride.mockReturnValue(undefined);
 		mockGetGlobalFreeOnly.mockReturnValue(true);
 		vi.stubGlobal("fetch", mockFetch);
 
@@ -101,16 +98,22 @@ describe("LLM7 factory wiring", () => {
 		} as unknown as ExtensionAPI;
 	});
 
-	it("factory is network-free and registers the native provider empty — even with no API key", async () => {
+	it("factory is network-free and registers the native provider seeded — even with no API key", async () => {
 		await llm7Provider(mockPi);
 
-		// The factory never fetches: models load via refreshModels. Unlike the
-		// legacy registration, a missing LLM7_API_KEY does NOT skip the provider.
+		// The factory never fetches: the static selector catalog is seeded
+		// at assembly (models load via refreshModels after that). Unlike
+		// the legacy registration, a missing LLM7_API_KEY does NOT skip
+		// the provider.
 		expect(mockFetch).not.toHaveBeenCalled();
 		expect(mockRegisterProvider).toHaveBeenCalledTimes(1);
-		const provider = mockRegisterProvider.mock.calls[0][0];
+		const provider = mockRegisterProvider.mock.calls[0]![0];
 		expect(provider.id).toBe("llm7");
-		expect(provider.getModels()).toEqual([]);
+		expect(provider.getModels().map((m: { id: string }) => m.id)).toEqual([
+			"default",
+			"fast",
+			"pro",
+		]);
 		expect(provider.auth.apiKey).toBeDefined();
 
 		// Lifecycle handlers + toggle command registered.
@@ -141,82 +144,33 @@ describe("LLM7 factory wiring", () => {
 		).toBe(true);
 	});
 
-	it("refreshModels populates; global /toggle-free reRegister republishes the same provider", async () => {
+	// Population + views are proven live by rpc-session-check (llm7 anchor
+	// with free-only, all-view, and persistence phases); this pins the
+	// re-registration wiring (same object, auth preserved) that RPC
+	// cannot see per provider.
+	it("global /toggle-free reRegister republishes the same provider object", async () => {
 		await llm7Provider(mockPi);
-		const provider = mockRegisterProvider.mock.calls[0][0];
+		const provider = mockRegisterProvider.mock.calls[0]![0];
 
 		expect(capturedToggleArgs).toHaveLength(1);
-		const [, stored, reRegister] = capturedToggleArgs[0] as [
-			string,
-			{ free: unknown[]; all: unknown[] },
-			() => void,
-		];
+		const reRegister = capturedToggleArgs[0]![2] as () => void;
 
-		// Pi refreshes (online) -> static catalogs populate.
-		await provider.refreshModels({ store: makeStore(), allowNetwork: true });
-		expect(stored.all).toHaveLength(3);
-		expect(stored.free).toHaveLength(2);
-
-		// Global /toggle-free showing all -> re-register the same provider.
 		mockRegisterProvider.mockClear();
 		reRegister();
-		expect(provider.getModels().map((m: { id: string }) => m.id)).toEqual([
-			"default",
-			"fast",
-			"pro",
-		]);
 		// Re-registration reused the SAME native provider object (auth preserved).
 		expect(mockRegisterProvider).toHaveBeenCalledWith(provider);
-
-		// Global /toggle-free showing free invalidates the same provider object;
-		// Pi's filterModels applies the free view to the complete catalog.
-		reRegister();
-		expect(provider.getModels().map((m: { id: string }) => m.id)).toEqual([
-			"default",
-			"fast",
-			"pro",
-		]);
 	});
 
-	it("/toggle-llm7 flips llm7_show_paid and shows the full catalog, then back", async () => {
+	// Flip/persist/view behavior is proven live by rpc-session-check
+	// (/toggle-llm7 through prompt dispatch, incl. persistence across
+	// replacement); this pins the per-provider wiring that would
+	// otherwise go unverified.
+	it("registers the toggle-llm7 command", async () => {
 		await llm7Provider(mockPi);
-		const provider = mockRegisterProvider.mock.calls[0][0];
-		await provider.refreshModels({ store: makeStore(), allowNetwork: true });
-
 		const call = mockRegisterCommand.mock.calls.find(
 			(c) => c[0] === "toggle-llm7",
 		);
-		if (!call) throw new Error("toggle-llm7 not registered");
-		const notify = vi.fn();
-
-		// First toggle: free -> all.
-		await call[1].handler({}, { ui: { notify } });
-		expect(mockSaveConfig).toHaveBeenCalledWith({ llm7_show_paid: true });
-		expect(provider.getModels().map((m: { id: string }) => m.id)).toEqual([
-			"default",
-			"fast",
-			"pro",
-		]);
-		expect(notify).toHaveBeenCalledWith(
-			expect.stringContaining("showing all 3 models"),
-			"info",
-		);
-
-		// Second toggle: all -> free. The complete catalog remains registered;
-		// Pi's filterModels applies the free view.
-		mockGetLlm7ShowPaid.mockReturnValue(true);
-		notify.mockClear();
-		await call[1].handler({}, { ui: { notify } });
-		expect(mockSaveConfig).toHaveBeenCalledWith({ llm7_show_paid: false });
-		expect(provider.getModels().map((m: { id: string }) => m.id)).toEqual([
-			"default",
-			"fast",
-			"pro",
-		]);
-		expect(notify).toHaveBeenCalledWith(
-			expect.stringContaining("showing 2 free models"),
-			"info",
-		);
+		expect(call).toBeDefined();
 	});
 
 	it("shows the ToS notice once for keyless LLM7 selections, never with a key", async () => {
@@ -257,16 +211,14 @@ describe("LLM7 factory wiring", () => {
 		expect(notify).not.toHaveBeenCalled();
 	});
 
-	it("session_start nudges the model registry refresh and is safe without one", async () => {
+	// Nudge scoping/retry is pinned in native-refresh-nudge.test.ts; the
+	// live RPC suite proves refresh populates. This pins the wiring.
+	it("session_start registers a refresh-nudge handler safe without a registry", async () => {
 		await llm7Provider(mockPi);
 		const handler = mockOn.mock.calls.find(
 			(call) => call[0] === "session_start",
 		)?.[1];
 		expect(handler).toBeDefined();
-
-		const refresh = vi.fn().mockResolvedValue(undefined);
-		await handler({}, { modelRegistry: { refresh } });
-		expect(refresh).toHaveBeenCalledWith({ allowNetwork: true });
 
 		// No modelRegistry on the context -> safe no-op.
 		await expect(handler({}, {})).resolves.toBeUndefined();

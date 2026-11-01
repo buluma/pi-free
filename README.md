@@ -14,7 +14,7 @@ Free and paid AI model providers for [Pi](https://pi.dev). Access models from mu
 
 When you install pi-free, it:
 
-1. Registers native providers such as Kilo, Cline, LLM7, FastRouter, Ollama Cloud, OpenModel, StepFun, and more.
+1. Registers native providers such as Kilo, Cline, LLM7, FastRouter, Ollama Cloud, StepFun, and more.
 2. Registers Qoder through Pi's native provider surface and supports Pi's built-in OpenCode, OpenCode Go, and OpenRouter integrations.
 3. Uses Pi's native model and auth stores for all extension providers; Ollama Cloud and Qoder retain documented compatibility caches only for auxiliary behavior.
 4. Applies the global free-only filter by default, while preserving provider-specific paid/trial behavior.
@@ -22,6 +22,7 @@ When you install pi-free, it:
 6. Supports OAuth and API-key authentication where a provider offers them.
 7. Adds Coding Index scores to model names and can probe and hide unavailable models.
 8. Provides `/pi-free-health` and `/free-startup` diagnostics without exposing credentials.
+9. Auto-fallbacks to another free model when the current one errors (see [Auto-fallback](#auto-fallback)).
 
 ## Install
 
@@ -58,7 +59,10 @@ Qoder supports `/login qoder` with PAT or browser OAuth, then `/toggle-qoder` sw
 /toggle-kilo
 /toggle-openrouter
 /toggle-free
+/toggle-auto-fallback
 /free-providers
+/free-fallback-history
+/reset-fallback-blacklist
 /pi-free-health
 ```
 
@@ -69,22 +73,64 @@ First run creates `~/.pi/free.json`. Add extension-provider keys there or use th
 ```json
 {
   "ollama_api_key": "...",
-  "anyapi_api_key": "...",
-  "openmodel_api_key": "..."
+  "anyapi_api_key": "..."
 }
 ```
+
+## Infron rate-limit continuation
+
+After Pi's automatic retries and recovery finish, a final Infron HTTP 429 with code `tpm_rate_limit_exceeded` and “Please try again after N seconds” queues a native continuation on the **same model**. Its next active run waits the **last response's** advertised delay before sending a request (for example, responses advertising 20/17/12/3 seconds result in one 3-second cooldown after retry exhaustion). The displayed “Retry failed after …” summary is UI text, not something the error matcher requires.
+
+This works independently of auto-fallback and has no nudge limit. Escape, model/session changes or fresh input cancel the automatic request promptly. A queued continuation entry may remain visible after cancellation, but no stale HTTP request is sent. `/free-infron-retry` shows lifecycle counters and the current phase; file logs record each known decision reason once per session, without error payloads or credentials.
+
+## Auto-fallback
+
+When enabled and the current free model errors, pi-free automatically switches to another free model so the conversation keeps moving. The switch fires from `agent_settled` — the point in Pi's run lifecycle where no further automatic retry, compaction, or queued continuation will run — so pi-free never races Pi's own same-model retries. **Off by default** (a switch rewrites the active model for the session): opt in with `/toggle-auto-fallback`, `auto_fallback: true`, or `AUTO_FALLBACK=true`.
+
+Three commands:
+
+- `/toggle-auto-fallback` — on/off switch (persists in `~/.pi/free.json`).
+- `/free-fallback-history` — list of session switches + current blacklist.
+- `/reset-fallback-blacklist` — clear the in-memory blacklist (escape hatch after an exhaustion).
+
+Configuration (`~/.pi/free.json`, all optional, defaults shown):
+
+```jsonc
+{
+  "auto_fallback": true,                          // master switch
+  "auto_fallback_scope": "provider",             // "provider" | "global" | "whitelist"
+  "auto_fallback_providers": [],                 // only when scopes="whitelist"
+  "auto_fallback_blacklist_ttl_ms": 600000,      // 10-min soft ban window
+  "auto_fallback_blacklist_max": 3,              // strikes → permanent session ban
+  "fallback_notify": "toast",                    // "silent" | "toast" | "status_bar" | "both"
+  "fallback_restore": "manual"                   // "manual" | "auto_next_turn" | "auto_session_end"
+}
+```
+
+How it picks the next one: highest Coding Index score among free models not currently blacklisted, scoped to the failing provider by default. The blacklist uses a counter + time dual rule — a single transient quota error expires after the TTL, but `max` strikes in the window promotes the model to a hard session ban.
+
+Caveats:
+
+- **Mid-flight switching is not possible from extensions** (Pi does not expose a turn-replay hook; issue #1248, `not_planned`). The failed turn is shown to the user as an error; the *next* turn uses the new model.
+- **`setModel()` rewrites the global default** (issue #1248). Recovery can optionally restore the user's pre-fallback pick via `fallback_restore: "auto_next_turn"`.
+- Errors are classified by HTTP status (4xx recoverable set: 429/402/408/425; 5xx all) and `errorMessage` regex (mirrors pi-ai's `isRetryableAssistantError`). 401/403/404/422 are *not* recoverable — switching would only burn candidates.
+- All classifications run without reading response bodies (AGENTS.md wire-signature convention).
 
 ## Provider Catalog
 
 | Category | Providers |
 | --- | --- |
-| Free/free-tier | Kilo, Cline, LLM7, OpenModel, TokenRouter, Qoder basic tier, and eligible models from other catalogs |
+| Free/free-tier | Kilo, Cline, LLM7, TokenRouter, Agnes AI, Qoder basic tier, and eligible models from other catalogs |
 | Freemium | AnyAPI, Ollama Cloud, SambaNova |
-| Paid/trial | ZenMux, CrofAI, DeepInfra trial, Novita, Routeway, OpenGateway, B.AI, StepFun, and paid catalog entries from other providers |
-| Native lifecycle | Kilo, Cline, LLM7, Ollama Cloud, AnyAPI, SambaNova, TokenRouter, OpenModel, ZenMux, CrofAI, DeepInfra, Novita, Routeway, OpenGateway, B.AI, FastRouter, StepFun |
-| Built-in | OpenCode, OpenCode Go, OpenRouter |
+| Paid/trial | ZenMux, DeepInfra trial, Novita, Routeway, OpenGateway, B.AI, StepFun, GMI Cloud, Venice AI, Infron AI, and paid catalog entries from other providers |
+| Native lifecycle | Kilo, Cline, LLM7, Ollama Cloud, AnyAPI, SambaNova, TokenRouter, ZenMux, DeepInfra, Novita, Routeway, OpenGateway, B.AI, FastRouter, StepFun, GMI Cloud, Agnes AI, Venice AI, Infron AI |
+| Built-in | OpenCode, OpenCode Go, OpenRouter — captured from Pi and refreshed in place after session start (OpenCode Zen catalog + public OpenRouter endpoint), so new models appear without waiting for a Pi release |
 
-Provider availability, authentication, and exact API-key names are maintained in [docs/providers.md](docs/providers.md). pi-free does not publish model counts because provider catalogs change.
+Provider availability, authentication, and exact API-key names are maintained in [docs/providers.md](docs/providers.md). pi-free does not publish model counts as guarantees because provider catalogs change — but a dated **free-model snapshot** (per-provider model lists + usage conditions) is maintained in [docs/free_models.md](docs/free_models.md).
+
+### Live catalog audit
+
+Point-in-time verification of free/paid classification against every provider's real `/models` endpoint — methodology, counts, and per-audit notes live in [docs/catalog-audit.md](docs/catalog-audit.md), per-model lists in [docs/free_models.md](docs/free_models.md). Counts drift as providers change their catalogs — treat audits as verified snapshots, not promises.
 
 ### Catalog and credential storage
 

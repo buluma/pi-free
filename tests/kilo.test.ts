@@ -17,6 +17,11 @@ const mockGetKiloApiKey = vi.hoisted(() =>
 	vi.fn((): string | undefined => undefined),
 );
 const mockGetKiloShowPaid = vi.hoisted(() => vi.fn(() => false));
+const mockGetGlobalFreeOnly = vi.hoisted(() => vi.fn(() => true));
+const mockGetModelViewOverride = vi.hoisted(() =>
+	vi.fn((_providerId: string): "free" | "all" | undefined => undefined),
+);
+const mockSetModelViewOverride = vi.hoisted(() => vi.fn());
 const mockSaveConfig = vi.hoisted(() =>
 	vi.fn<(...args: unknown[]) => Promise<void>>(),
 );
@@ -43,6 +48,11 @@ const mockLogger = vi.hoisted(() => ({
 vi.mock("../config.ts", () => ({
 	getKiloApiKey: () => mockGetKiloApiKey(),
 	getKiloShowPaid: () => mockGetKiloShowPaid(),
+	isOhMyPiCompat: () => false,
+	getModelViewOverride: (providerId: string) =>
+		mockGetModelViewOverride(providerId),
+	setModelViewOverride: (...args: unknown[]) =>
+		mockSetModelViewOverride(...args),
 	saveConfig: (...args: unknown[]) => mockSaveConfig(...args),
 	PROVIDER_KILO: "kilo",
 }));
@@ -50,6 +60,12 @@ vi.mock("../config.ts", () => ({
 vi.mock("../lib/registry.ts", () => ({
 	registerWithGlobalToggle: (...args: unknown[]) =>
 		mockRegisterWithGlobalToggle(...args),
+	getGlobalFreeOnly: () => mockGetGlobalFreeOnly(),
+	// Mirrors the real resolveModelView over the mocked config getters (the
+	// real rule is unit-tested in registry-provider-overrides.test.ts).
+	resolveModelView: (providerId: string) =>
+		mockGetModelViewOverride(providerId) ??
+		(mockGetKiloShowPaid() ? "all" : mockGetGlobalFreeOnly() ? "free" : "all"),
 }));
 
 vi.mock("../providers/kilo/kilo-provider.ts", () => ({
@@ -76,6 +92,8 @@ describe("Kilo extension wiring", () => {
 		vi.clearAllMocks();
 		mockGetKiloApiKey.mockReturnValue(undefined);
 		mockGetKiloShowPaid.mockReturnValue(false);
+		mockGetModelViewOverride.mockReturnValue(undefined);
+		mockGetGlobalFreeOnly.mockReturnValue(true);
 		mockStored.free = [{ id: "free-1" }];
 		mockStored.all = [{ id: "free-1" }, { id: "paid-1" }];
 
@@ -128,7 +146,8 @@ describe("Kilo extension wiring", () => {
 
 	it("global-toggle reRegister republishes the same provider object", async () => {
 		await kiloProvider(mockPi);
-		const reRegister = mockRegisterWithGlobalToggle.mock.calls[0][2] as () => void;
+		const reRegister = mockRegisterWithGlobalToggle.mock
+			.calls[0]![2] as () => void;
 		mockRegisterProvider.mockClear();
 
 		reRegister();
@@ -137,24 +156,15 @@ describe("Kilo extension wiring", () => {
 	});
 
 	describe("/toggle-kilo command", () => {
-		it("flips show_paid, persists, and republishes the chosen catalog", async () => {
+		// Flip/persist/view behavior is proven live by rpc-toggle-check
+		// (opencode-free) + rpc-session-check (/toggle-llm7); this pins
+		// the per-provider wiring that would otherwise go unverified.
+		it("registers the toggle command", async () => {
 			await kiloProvider(mockPi);
 			const call = mockRegisterCommand.mock.calls.find(
 				(c) => c[0] === "toggle-kilo",
 			);
 			expect(call).toBeDefined();
-			if (!call) throw new Error("toggle-kilo not registered");
-			const notify = vi.fn();
-			mockRegisterProvider.mockClear();
-
-			await call[1].handler({}, { ui: { notify } });
-
-			expect(mockSaveConfig).toHaveBeenCalledWith({ kilo_show_paid: true });
-			expect(mockRegisterProvider).toHaveBeenCalledWith(mockProvider);
-			expect(notify).toHaveBeenCalledWith(
-				expect.stringContaining("showing all 2 models"),
-				"info",
-			);
 		});
 	});
 
@@ -176,7 +186,10 @@ describe("Kilo extension wiring", () => {
 			expect(notify).not.toHaveBeenCalled();
 			expect(mockLogger.debug).toHaveBeenCalledWith(
 				"Free-model terms notice",
-				expect.objectContaining({ provider: "kilo", termsUrl: expect.any(String) }),
+				expect.objectContaining({
+					provider: "kilo",
+					termsUrl: expect.any(String),
+				}),
 			);
 		});
 
@@ -186,11 +199,14 @@ describe("Kilo extension wiring", () => {
 			if (!call) throw new Error("model_select not registered");
 			const notify = vi.fn();
 			const isUsingOAuth = vi.fn(() => true);
-			await call[1]({}, {
-				model: { provider: "kilo" },
-				modelRegistry: { isUsingOAuth },
-				ui: { notify },
-			});
+			await call[1](
+				{},
+				{
+					model: { provider: "kilo" },
+					modelRegistry: { isUsingOAuth },
+					ui: { notify },
+				},
+			);
 			expect(isUsingOAuth).toHaveBeenCalledWith({ provider: "kilo" });
 			expect(notify).not.toHaveBeenCalled();
 		});

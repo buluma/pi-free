@@ -5,6 +5,7 @@
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { withFileLock, writeFileAtomicSync } from "./atomic-file.ts";
 import { createLogger } from "./logger.ts";
 import { ensureDir } from "./paths.ts";
 
@@ -15,8 +16,23 @@ const _logger = createLogger("json-persistence");
  * Filters out `__proto__` and `constructor` keys at every level of the
  * parsed object, preventing attackers from polluting Object.prototype
  * through crafted config/cache files.
+ *
+ * The value type mirrors config.ts: a real JSON shape, not a bare unknown
+ * alias — the reviver contract only ever passes JSON-representable values.
  */
-function safeJsonReviver(_key: string, value: unknown): unknown {
+type JsonReviverValue =
+	| string
+	| number
+	| boolean
+	| null
+	| { [key: string]: unknown }
+	| unknown[]
+	| undefined;
+
+function safeJsonReviver(
+	_key: string,
+	value: JsonReviverValue,
+): JsonReviverValue {
 	if (_key === "__proto__" || _key === "constructor") {
 		return undefined;
 	}
@@ -47,19 +63,30 @@ export interface JSONStoreOptions {
 	debounceMs?: number;
 }
 
-class Lock {
-	private promise: Promise<void> = Promise.resolve();
+/**
+ * Read the current disk state, bypassing the in-memory memo. Update paths
+ * must use this inside the file lock: `load()` serves the memoized parse,
+ * which is stale when another process wrote since this process last read.
+ * Corrupt-file warnings fire once per path per session (update paths read
+ * on every call; a corrupt file must not spam the log on hot stores).
+ */
+const _readWarned = new Set<string>();
 
-	async acquire(): Promise<() => void> {
-		let release: () => void;
-		const newPromise = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		const previous = this.promise;
-		this.promise = previous.then(() => newPromise);
-		await previous;
-		return release!;
+function readFresh<T extends object>(filepath: string, defaultValue: T): T {
+	try {
+		if (existsSync(filepath)) {
+			return JSON.parse(readFileSync(filepath, "utf-8"), safeJsonReviver) as T;
+		}
+	} catch (err) {
+		if (!_readWarned.has(filepath)) {
+			_readWarned.add(filepath);
+			_logger.warn("Failed to load JSON store, using default", {
+				filepath,
+				error: err,
+			});
+		}
 	}
+	return defaultValue;
 }
 
 /**
@@ -71,34 +98,18 @@ export function createJSONStore<T extends object>(
 	options: JSONStoreOptions = {},
 ): JSONStore<T> {
 	let cached: T | null = null;
-	const lock = new Lock();
 	const debounceMs = options.debounceMs ?? 0;
 	let flushTimer: ReturnType<typeof setTimeout> | undefined;
 
 	function load(): T {
 		if (cached) return cached;
-		try {
-			if (existsSync(filepath)) {
-				cached = JSON.parse(
-					readFileSync(filepath, "utf-8"),
-					safeJsonReviver,
-				) as T;
-				return cached;
-			}
-		} catch (err) {
-			_logger.warn("Failed to load JSON store, using default", {
-				filepath,
-				error: err,
-			});
-		}
-		cached = defaultValue;
+		cached = readFresh(filepath, defaultValue);
 		return cached;
 	}
 
 	function writeDisk(data: T): void {
 		try {
-			ensureDir(dirname(filepath));
-			writeFileSync(filepath, `${JSON.stringify(data, null, 2)}\n`, "utf-8");
+			writeFileAtomicSync(filepath, `${JSON.stringify(data, null, 2)}\n`);
 		} catch (err) {
 			_logger.warn("Failed to save JSON store", { filepath, error: err });
 		}
@@ -130,15 +141,22 @@ export function createJSONStore<T extends object>(
 	}
 
 	async function update(updater: (data: T) => T): Promise<T> {
-		const release = await lock.acquire();
-		try {
-			const data = load();
+		// Fresh disk read inside the cross-process lock: building on the
+		// memoized `load()` here replays a possibly stale base and loses
+		// another process's updates even with the lock held (#611).
+		// Exception: while a debounced flush is still pending, the memo
+		// holds not-yet-flushed in-process updates that the disk does not
+		// have — basing on disk would lose those instead. The pending
+		// flush always wins over a concurrent external write (documented
+		// debounce-window limitation); once quiescent, reads go to disk.
+		return withFileLock(filepath, () => {
+			const dirty = flushTimer !== undefined;
+			const data =
+				dirty && cached !== null ? cached : readFresh(filepath, defaultValue);
 			const updated = updater(data);
 			save(updated);
 			return updated;
-		} finally {
-			release();
-		}
+		});
 	}
 
 	return { load, save, update, flush };
@@ -158,8 +176,6 @@ export function createJSONLStore<T extends object>(
 	append(entry: T): Promise<void>;
 	clear(): Promise<void>;
 } {
-	const lock = new Lock();
-
 	function load(): T[] {
 		try {
 			if (existsSync(filepath)) {
@@ -189,27 +205,34 @@ export function createJSONLStore<T extends object>(
 	}
 
 	async function append(entry: T): Promise<void> {
-		const release = await lock.acquire();
-		try {
-			ensureDir(dirname(filepath));
-			const line = JSON.stringify(entry);
-			writeFileSync(filepath, `${line}\n`, { flag: "a", encoding: "utf-8" });
-		} catch (err) {
-			_logger.warn("Failed to append to JSONL store", { filepath, error: err });
-		} finally {
-			release();
-		}
+		return withFileLock(filepath, () => {
+			try {
+				ensureDir(dirname(filepath));
+				const line = JSON.stringify(entry);
+				writeFileSync(filepath, `${line}\n`, {
+					flag: "a",
+					encoding: "utf-8",
+				});
+			} catch (err) {
+				_logger.warn("Failed to append to JSONL store", {
+					filepath,
+					error: err,
+				});
+			}
+		});
 	}
 
 	async function clear(): Promise<void> {
-		const release = await lock.acquire();
-		try {
-			writeFileSync(filepath, "", "utf-8");
-		} catch (err) {
-			_logger.warn("Failed to clear JSONL store", { filepath, error: err });
-		} finally {
-			release();
-		}
+		return withFileLock(filepath, () => {
+			try {
+				writeFileAtomicSync(filepath, "");
+			} catch (err) {
+				_logger.warn("Failed to clear JSONL store", {
+					filepath,
+					error: err,
+				});
+			}
+		});
 	}
 
 	return { load, append, clear };

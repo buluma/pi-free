@@ -36,7 +36,7 @@ const PAT_REFRESH_PREFIX = "pat";
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 /** Extended credentials with Qoder-specific identity fields. */
-export interface QoderCredentials extends OAuthCredentials {
+interface QoderCredentials extends OAuthCredentials {
 	userID: string;
 	email: string;
 	name: string;
@@ -247,9 +247,7 @@ async function buildDeviceFlowCredentials(
 ): Promise<QoderCredentials> {
 	const expireMs = parseExpiresAt(tokenData.expires_at, tokenData.expires_in);
 
-	(callbacks as unknown as { onProgress?: (msg: string) => void }).onProgress?.(
-		"Fetching user profile...",
-	);
+	callbacks.onProgress?.("Fetching user profile...");
 	let email = "";
 	let name = "";
 	try {
@@ -274,9 +272,7 @@ async function buildDeviceFlowCredentials(
 		// Best-effort
 	}
 
-	(callbacks as unknown as { onProgress?: (msg: string) => void }).onProgress?.(
-		"Login successful!",
-	);
+	callbacks.onProgress?.("Login successful!");
 
 	return {
 		refresh: `${tokenData.refresh_token}|${tokenData.user_id}|${machineID}`,
@@ -305,15 +301,9 @@ async function runDeviceFlow(
 	const verificationURI = `https://qoder.com/device/selectAccounts?challenge=${codeChallenge}&challenge_method=S256&machine_id=${machineID}&nonce=${nonce}`;
 
 	// Notify user
-	(callbacks as unknown as { onProgress?: (msg: string) => void }).onProgress?.(
-		"Please complete login in your browser...",
-	);
+	callbacks.onProgress?.("Please complete login in your browser...");
 
-	(
-		callbacks as unknown as {
-			onAuth?: (info: { url: string; instructions: string }) => void;
-		}
-	).onAuth?.({
+	callbacks.onAuth({
 		url: verificationURI,
 		instructions: "Click to sign in with your Qoder account in the browser.",
 	});
@@ -323,8 +313,7 @@ async function runDeviceFlow(
 	const maxAttempts = 90; // 3 minutes
 
 	// Helper to read signal
-	const getSignal = (): AbortSignal | undefined =>
-		(callbacks as unknown as { signal?: AbortSignal }).signal;
+	const getSignal = (): AbortSignal | undefined => callbacks.signal;
 
 	for (let attempt = 0; attempt < maxAttempts; attempt++) {
 		if (getSignal()?.aborted) throw new Error("Login cancelled");
@@ -332,14 +321,18 @@ async function runDeviceFlow(
 		await abortableDelay(pollInterval, getSignal());
 
 		try {
-			const response = await fetch(pollURL, {
+			// RequestInit is lib.dom (no undefined members): getSignal()
+			// may return undefined — omit instead of assigning it.
+			const pollInit: RequestInit = {
 				method: "GET",
 				headers: {
 					Accept: "application/json",
 					"User-Agent": UA,
 				},
-				signal: getSignal(),
-			});
+			};
+			const pollSignal = getSignal();
+			if (pollSignal) pollInit.signal = pollSignal;
+			const response = await fetch(pollURL, pollInit);
 
 			if (response.status === 202 || response.status === 404) {
 				continue;
@@ -368,7 +361,7 @@ async function runDeviceFlow(
 		} catch (e: unknown) {
 			const err = e as { name?: string };
 			if (err.name === "AbortError" || getSignal()?.aborted) {
-				throw new Error("Login cancelled");
+				throw new Error("Login cancelled", { cause: e });
 			}
 			throw e;
 		}
@@ -398,24 +391,14 @@ export async function loginQoder(
 			const creds = await credentialsFromPat(pat);
 			return creds as OAuthCredentials;
 		} catch {
-			(
-				callbacks as unknown as { onProgress?: (msg: string) => void }
-			).onProgress?.(
+			callbacks.onProgress?.(
 				"Environment PAT invalid, falling back to interactive login...",
 			);
 		}
 	}
 
 	// 2. Prompt for PAT or browser login
-	const prompt = (
-		callbacks as unknown as {
-			onPrompt: (p: {
-				message: string;
-				placeholder?: string;
-				allowEmpty?: boolean;
-			}) => Promise<string>;
-		}
-	).onPrompt;
+	const prompt = callbacks.onPrompt;
 
 	if (!prompt) {
 		throw new Error("Login cancelled: no prompt handler available");
@@ -428,7 +411,7 @@ export async function loginQoder(
 		allowEmpty: true,
 	});
 
-	if ((callbacks as unknown as { signal?: AbortSignal }).signal?.aborted) {
+	if (callbacks.signal?.aborted) {
 		throw new Error("Login cancelled");
 	}
 
@@ -538,12 +521,16 @@ export async function refreshQoderToken(
 export async function loginQoderNative(
 	interaction: AuthInteraction,
 ): Promise<OAuthCredential> {
-	const credentials = await loginQoder({
+	// OAuthLoginCallbacks is Pi-owned (no undefined members): omit
+	// signal/instructions/placeholder instead of assigning undefined.
+	const callbacks: OAuthLoginCallbacks = {
 		onAuth: (info: { url: string; instructions?: string }) =>
 			interaction.notify({
 				type: "auth_url",
 				url: info.url,
-				instructions: info.instructions,
+				...(info.instructions !== undefined
+					? { instructions: info.instructions }
+					: {}),
 			}),
 		onProgress: (message: string) =>
 			interaction.notify({ type: "progress", message }),
@@ -551,10 +538,26 @@ export async function loginQoderNative(
 			interaction.prompt({
 				type: "text",
 				message: prompt.message,
-				placeholder: prompt.placeholder,
+				...(prompt.placeholder !== undefined
+					? { placeholder: prompt.placeholder }
+					: {}),
 			}),
-		signal: interaction.signal,
-	} as unknown as OAuthLoginCallbacks);
+		// The device/PAT flow exercised by this adapter only invokes
+		// onAuth/onProgress/onPrompt/signal. The interface's remaining required
+		// hooks are implemented explicitly (not cast away) so the object is a
+		// genuine OAuthLoginCallbacks: onDeviceCode surfaces the verification
+		// info through Pi's normalized event, and onSelect has no Qoder
+		// equivalent — it can only be reached by future flow changes.
+		onDeviceCode: (info) =>
+			interaction.notify({
+				type: "device_code",
+				userCode: info.userCode,
+				verificationUri: info.verificationUri,
+			}),
+		onSelect: () => Promise.resolve(undefined),
+	};
+	if (interaction.signal) callbacks.signal = interaction.signal;
+	const credentials = await loginQoder(callbacks);
 	return { ...credentials, type: "oauth" };
 }
 
@@ -569,7 +572,7 @@ export async function refreshQoderCredential(
 	return { ...(await refreshQoderToken(credential)), type: "oauth" };
 }
 
-export const qoderOAuthAuth: OAuthAuth = {
+const qoderOAuthAuth: OAuthAuth = {
 	name: "Qoder (Browser OAuth / PAT)",
 	loginLabel: "Sign in with Qoder",
 	login: loginQoderNative,

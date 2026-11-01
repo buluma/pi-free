@@ -51,7 +51,7 @@ async function resolveLlm7ApiKey(input: {
 	};
 }
 
-export const llm7ApiKeyAuth: ApiKeyAuth = {
+const llm7ApiKeyAuth: ApiKeyAuth = {
 	name: "LLM7 API key",
 	async login(interaction: AuthInteraction): Promise<ApiKeyCredential> {
 		const key = await interaction.prompt({

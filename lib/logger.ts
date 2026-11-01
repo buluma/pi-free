@@ -9,9 +9,14 @@
  * - Rotate size: PI_FREE_LOG_MAX_BYTES=10485760 (default 10 MiB; 3 backups)
  */
 
+import { AsyncLocalStorage } from "node:async_hooks";
+import { randomUUID } from "node:crypto";
 import {
 	appendFileSync,
 	createWriteStream,
+	renameSync,
+	rmSync,
+	statSync,
 	type WriteStream,
 } from "node:fs";
 import { mkdir as mkdirAsync, rename, rm, stat } from "node:fs/promises";
@@ -25,7 +30,7 @@ interface LogEntry {
 	level: LogLevel;
 	namespace: string;
 	message: string;
-	data?: Record<string, unknown>;
+	data?: Record<string, unknown> | undefined;
 }
 
 const LOG_LEVELS: Record<LogLevel, number> = {
@@ -59,8 +64,11 @@ function shouldLog(level: LogLevel, minLevel: LogLevel): boolean {
 }
 
 function sanitizeLogText(value: string): string {
-	return value.replace(/[\u0000-\u001f\u007f]/g, (character) =>
-		`\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
+	return value.replace(
+		// eslint-disable-next-line no-control-regex -- intentional: this IS the control-character escaper.
+		/[\u0000-\u001f\u007f]/g,
+		(character) =>
+			`\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
 	);
 }
 
@@ -73,7 +81,7 @@ function formatMessage(entry: LogEntry): string {
 			data = " [unserializable-data]";
 		}
 	}
-	return `[${entry.timestamp}] [${entry.level.toUpperCase()}] [${sanitizeLogText(entry.namespace)}] ${sanitizeLogText(entry.message)}${data}`;
+	return `[${entry.timestamp}] [${entry.level.toUpperCase()}] [pid ${process.pid}] [${sanitizeLogText(entry.namespace)}] ${sanitizeLogText(entry.message)}${data}`;
 }
 
 const LOG_PATH = resolveSafeDataFile(process.env.PI_FREE_LOG_PATH, "free.log");
@@ -85,7 +93,10 @@ const MAX_LOG_BYTES = parsePositiveInteger(
 );
 const LOG_BACKUP_COUNT = 3;
 
-function parsePositiveInteger(value: string | undefined, fallback: number): number {
+function parsePositiveInteger(
+	value: string | undefined,
+	fallback: number,
+): number {
 	if (!value) return fallback;
 	const parsed = Number(value);
 	return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
@@ -102,6 +113,75 @@ let logStreamUnavailable = false;
 let logStreamReady: Promise<void> | null = null;
 let logBytes = 0;
 const queuedLines: string[] = [];
+// Lines handed to the open stream whose write callbacks have not fired yet,
+// i.e. data that may still sit in the stream's user-space buffer and would be
+// LOST if the process exits hard (pi's main.js calls process.exit(0) right
+// after extension startup). flushLogsSync() recovers exactly these lines via
+// a synchronous append. Callbacks fire in write order, so FIFO shift is exact.
+const pendingStreamLines: string[] = [];
+
+// Writes the stream accepted but never confirmed, because it was torn down
+// (rotation end, shutdown destroy, or an external close) before the write's
+// own callback fired. Bounded counter plus a truncated last-error message —
+// no unbounded line buffer — readable at runtime via getLogWriteFailures()
+// and surfaced through /pi-free-health.
+let logWriteFailures = 0;
+let lastLogWriteError: string | null = null;
+
+function recordLogWriteFailure(err: unknown): void {
+	logWriteFailures += 1;
+	lastLogWriteError = String(err instanceof Error ? err.message : err).slice(
+		0,
+		200,
+	);
+}
+
+/**
+ * Recover a single line the stream accepted but lost (its write callback
+ * fired with an error). Retries once through the synchronous append path —
+ * the same fallback flushQueuedFallback() already uses — before counting an
+ * unrecovered loss. Best-effort: never throws.
+ */
+function recoverLostStreamWrite(line: string, err: unknown): void {
+	try {
+		ensureLogDirOnce();
+		appendFileSync(LOG_PATH, line, "utf8");
+	} catch (retryErr) {
+		// MUTATION: removing this catch (letting the retry's own failure go
+		// unrecorded) silently loses the line a second time instead of
+		// counting it.
+		recordLogWriteFailure(retryErr ?? err);
+	}
+}
+
+function trackStreamWrite(stream: WriteStream, line: string): void {
+	pendingStreamLines.push(line);
+	stream.write(line, (err) => {
+		// FIFO: Node's Writable invokes buffered write callbacks in issue
+		// order, including the error callbacks fired when destroy() aborts
+		// them. flushLogsSync() may already have spliced this line out (and
+		// flushed it) before its callback runs; shift() then yields undefined
+		// and there is nothing left to recover.
+		const pending = pendingStreamLines.shift();
+		if (err && pending !== undefined) {
+			// MUTATION: deleting this branch (letting the error callback fall
+			// through to the no-op it used to be) reproduces the bug this test
+			// guards — a write the stream lost after rotation/shutdown teardown
+			// vanishes with no recovery and no record (issue #456).
+			recoverLostStreamWrite(pending, err);
+		}
+	});
+}
+
+/** Writes lost to stream teardown even after the one-shot recovery retry. */
+export function getLogWriteFailures(): number {
+	return logWriteFailures;
+}
+
+/** Bounded (200-char) message from the most recent unrecovered write failure. */
+export function getLastLogWriteError(): string | null {
+	return lastLogWriteError;
+}
 
 function ensureLogDirOnce(): void {
 	if (logDirEnsured) return;
@@ -140,12 +220,42 @@ async function rotateLogFilesIfNeeded(force = false): Promise<void> {
 	}
 }
 
+function rotateLogFileSyncIfNeeded(): void {
+	let size: number;
+	try {
+		size = statSync(LOG_PATH).size;
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw err;
+	}
+	if (size < MAX_LOG_BYTES) return;
+
+	for (let index = LOG_BACKUP_COUNT; index >= 1; index--) {
+		const source = index === 1 ? LOG_PATH : `${LOG_PATH}.${index - 1}`;
+		const target = `${LOG_PATH}.${index}`;
+		rmSync(target, { force: true });
+		try {
+			renameSync(source, target);
+		} catch (err) {
+			if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+		}
+	}
+}
+
 function flushQueuedFallback(): void {
 	if (queuedLines.length === 0) return;
 	const lines = queuedLines.splice(0);
 	try {
 		ensureLogDirOnce();
-		appendFileSync(LOG_PATH, lines.join(""), "utf8");
+		const data = lines.join("");
+		const bytes = Buffer.byteLength(data, "utf8");
+		if (logBytes > 0 && logBytes + bytes > MAX_LOG_BYTES) {
+			rotateLogFileSyncIfNeeded();
+			// After rotation LOG_PATH no longer exists; the append recreates it.
+			logBytes = 0;
+		}
+		appendFileSync(LOG_PATH, data, "utf8");
+		logBytes += bytes;
 	} catch (err) {
 		console.error("Failed to write to log file:", err);
 	}
@@ -153,6 +263,12 @@ function flushQueuedFallback(): void {
 
 function attachLogStream(stream: WriteStream, existingBytes: number): void {
 	stream.on("error", (err) => {
+		// Rotation and flushLogsSync() detach a stream before ending/destroying
+		// it. Node reports pending writes on that old stream as errors; the
+		// write callbacks already recover those lines, so do not surface an
+		// expected teardown on stderr. Errors from the active stream still
+		// switch logging to the synchronous fallback below.
+		if (stream !== logStream) return;
 		console.error("Failed to write to log file:", err);
 		logStreamUnavailable = true;
 		logStream = null;
@@ -162,19 +278,26 @@ function attachLogStream(stream: WriteStream, existingBytes: number): void {
 	logBytes = existingBytes;
 	const pending = queuedLines.splice(0);
 	for (let index = 0; index < pending.length; index++) {
-		const line = pending[index];
+		// Loop bounds prove defined.
+		const line = pending[index]!;
 		const bytes = Buffer.byteLength(line, "utf8");
 		if (logBytes > 0 && logBytes + bytes > MAX_LOG_BYTES) {
 			queuedLines.push(...pending.slice(index));
 			break;
 		}
-		stream.write(line);
+		trackStreamWrite(stream, line);
 		logBytes += bytes;
 	}
 }
 
 async function openLogStream(forceRotate = false): Promise<void> {
 	await ensureLogDirAsync();
+	// A synchronous flush may have declared streams unavailable while this
+	// open was in flight; bail out instead of re-attaching a stream.
+	if (logStreamUnavailable) {
+		flushQueuedFallback();
+		return;
+	}
 	await rotateLogFilesIfNeeded(forceRotate);
 	let existingBytes = 0;
 	try {
@@ -184,6 +307,13 @@ async function openLogStream(forceRotate = false): Promise<void> {
 	}
 	if (typeof createWriteStream !== "function") {
 		logStreamUnavailable = true;
+		flushQueuedFallback();
+		return;
+	}
+	// Re-check after the remaining awaits: a synchronous flush may have
+	// declared streams unavailable while this open was still in flight; bail
+	// out instead of re-attaching a stream that would buffer lines again.
+	if (logStreamUnavailable) {
 		flushQueuedFallback();
 		return;
 	}
@@ -237,13 +367,44 @@ function appendToFile(line: string): void {
 	const formatted = `${line}\n`;
 	const bytes = Buffer.byteLength(formatted, "utf8");
 	if (logStream && logBytes + bytes < MAX_LOG_BYTES) {
-		logStream.write(formatted);
+		trackStreamWrite(logStream, formatted);
 		logBytes += bytes;
 		return;
 	}
 
 	queuedLines.push(formatted);
+	if (logStreamUnavailable) {
+		// Sync-fallback mode (e.g. after flushLogsSync()): never defer to a
+		// stream open that may not complete before a hard process exit.
+		flushQueuedFallback();
+		return;
+	}
 	startLogStream(Boolean(logStream));
+}
+
+/**
+ * Ambient run-correlation ID, threaded through fan-out operations
+ * (global filter, per-provider toggles, restore, fallback switches,
+ * refresh nudges) so one user action's per-provider log lines share a
+ * tag. AsyncLocalStorage keeps concurrent runs distinct; outside a run
+ * no tag is attached. File-log only — never touches the TUI.
+ */
+const runIdStore = new AsyncLocalStorage<string>();
+
+/** Correlation tag for a user action's fan-out. CSPRNG-backed (Sonar
+ * S2245: avoid Math.random()); the first 8 hex chars of a UUID are ample. */
+export function newRunId(): string {
+	return randomUUID().slice(0, 8);
+}
+
+/** Run `fn` with `id` (generated when omitted) as the ambient run tag. */
+export function withRunId<T>(fn: () => T, id?: string): T {
+	return runIdStore.run(id ?? newRunId(), fn);
+}
+
+/** The ambient run tag, if inside withRunId. */
+export function getActiveRunId(): string | null {
+	return runIdStore.getStore() ?? null;
 }
 
 function log(
@@ -256,12 +417,13 @@ function log(
 	const logToFile = shouldLog(level, fileLevel);
 	if (!logToConsole && !logToFile) return;
 
+	const runId = getActiveRunId();
 	const entry: LogEntry = {
 		timestamp: new Date().toISOString(),
 		level,
 		namespace,
 		message,
-		data,
+		data: runId ? { run: runId, ...data } : data,
 	};
 
 	const formatted = formatMessage(entry);
@@ -291,6 +453,89 @@ function log(
 
 export function getLogPath(): string {
 	return LOG_PATH;
+}
+
+/**
+ * Guarantee that everything logged so far is on disk SYNCHRONOUSLY.
+ *
+ * Pi's main.js calls `process.exit(0)` right after extension startup, which
+ * discards the WriteStream's buffered (not-yet-flushed) writes and the queue
+ * of lines waiting for the stream to open — that is why the startup summary
+ * line was sometimes missing from free.log. This function:
+ *
+ * 1. Recovers lines still buffered in the open stream (tracked via write
+ *    callbacks), destroys the stream so its buffered copies are dropped
+ *    without duplicating the sync-written ones, and marks logging as
+ *    stream-unavailable so all subsequent lines use the synchronous path.
+ * 2. Appends everything (recovered + still-queued lines) with
+ *    `appendFileSync`, honoring the MAX_LOG_BYTES rotation policy via a
+ *    synchronous rotation when the size limit would be exceeded.
+ * 3. Schedules a delayed (unref'd) re-enable of the async WriteStream so a
+ *    long-running session does not pay `appendFileSync` for every later line;
+ *    until then (and if the process exits first) logging stays synchronous.
+ *
+ * Best-effort: never throws. Intended to be called once at the end of
+ * `piFreeEntry`, after `logStartupSummary()`.
+ */
+export function flushLogsSync(): void {
+	if (!FILE_LOG_ENABLED) return;
+	try {
+		if (logStream) {
+			const buffered = pendingStreamLines.splice(0);
+			const stream = logStream;
+			logStream = null;
+			logStreamUnavailable = true;
+			try {
+				stream.destroy();
+			} catch {
+				// best-effort
+			}
+			// Recover in front of any still-queued lines so file order is kept.
+			queuedLines.unshift(...buffered);
+			// Their bytes were already counted in logBytes when handed to the
+			// stream; un-count them so flushQueuedFallback doesn't double-count
+			// (which would trip size-based rotation early).
+			for (const line of buffered) {
+				logBytes = Math.max(0, logBytes - Buffer.byteLength(line, "utf8"));
+			}
+		} else {
+			// No open stream (either never opened, open still in flight, or
+			// already in sync-fallback mode). Everything pending is in
+			// queuedLines; stop any in-flight stream open from re-attaching.
+			logStreamUnavailable = true;
+		}
+		flushQueuedFallback();
+		scheduleAsyncLogReenable();
+	} catch (err) {
+		// Never break startup for an observability flush.
+		console.error("Failed to flush logs synchronously:", err);
+	}
+}
+
+/**
+ * Re-open the async WriteStream a short while after {@link flushLogsSync}, so
+ * runtime logging in a long-lived session goes back to buffered async writes
+ * instead of paying `appendFileSync` per line. The hard-exit risk this module
+ * guards against is Pi's immediate `process.exit(0)` right after startup; if
+ * the process is still alive when the timer fires, plain buffered logging is
+ * the right trade-off again. `unref()` keeps the timer from holding the
+ * process open. Best-effort: never throws.
+ */
+function scheduleAsyncLogReenable(): void {
+	try {
+		const timer = setTimeout(() => {
+			try {
+				if (logStream || logStreamReady) return;
+				logStreamUnavailable = false;
+				if (queuedLines.length > 0) startLogStream(false);
+			} catch {
+				logStreamUnavailable = true;
+			}
+		}, 5_000);
+		timer.unref?.();
+	} catch {
+		// best-effort; stay synchronous
+	}
 }
 
 export function isFileLoggingEnabled(): boolean {

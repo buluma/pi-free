@@ -43,7 +43,7 @@ For an OpenAI-compatible native provider, use `registerNativeOpenAIProvider` wit
 - an appropriate initial paid/trial policy; and
 - any provider-specific terms or probe support.
 
-For a custom wire protocol, implement both native stream entry points when the public `Provider` contract requires them. Cline is the native custom-API example. OpenModel is the native Anthropic Messages example.
+For a custom wire protocol, implement both native stream entry points when the public `Provider` contract requires them. Cline is the native custom-API example.
 
 ### 4. Register it
 
@@ -66,8 +66,6 @@ Update [`README.md`](README.md), [`docs/providers.md`](docs/providers.md), and [
 
 Most providers use OpenAI-compatible APIs. For custom protocols:
 
-- **Cline** uses the native `cline-xml-tools` API and XML tool bridge.
-- **OpenModel** uses the native Anthropic Messages API.
 - **Qoder** is the intentionally legacy reference for proprietary authentication and custom streaming; do not migrate it as part of an unrelated provider change.
 
 ## Shared helpers
@@ -90,6 +88,9 @@ Run the same checks as CI:
 
 ```bash
 npm run lint
+npm run format:check
+npm run lint:oxlint
+npm run check:knip
 npm run test:run
 ```
 
@@ -103,9 +104,11 @@ cd pi-free
 npm install
 git checkout -b feat/my-provider
 npm run lint
+npm run format:check
+npm run lint:oxlint
 npm run test:run
 git add -A
-git commit -m "feat: add myprovider"
+git commit -m "feat: add myprovider (refs #NNN)"
 git push origin feat/my-provider
 ```
 

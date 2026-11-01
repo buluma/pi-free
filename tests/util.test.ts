@@ -1,13 +1,16 @@
 import { describe, expect, it, vi } from "vitest";
 import {
 	cleanModelName,
+	computeRetryBackoffMs,
 	fetchWithRetry,
 	fetchWithTimeout,
 	isUsableModel,
 	logWarning,
 	mapOpenRouterModel,
+	MAX_RETRY_BACKOFF_MS,
 	parseModelResponse,
 	withFetchDeadline,
+	withSignal,
 } from "../lib/util.ts";
 
 describe("Utility Functions", () => {
@@ -268,7 +271,7 @@ describe("Utility Functions", () => {
 			);
 
 			expect(result.data).toHaveLength(2);
-			expect(result.data[0].id).toBe("model-1");
+			expect(result.data[0]!.id).toBe("model-1");
 		});
 
 		it("should throw on non-ok response", async () => {
@@ -453,6 +456,51 @@ describe("Utility Functions", () => {
 		});
 	});
 
+	describe("computeRetryBackoffMs", () => {
+		it("scales exponentially with the attempt and stays under the window", () => {
+			const alwaysMax = () => 0.999999;
+			expect(
+				computeRetryBackoffMs(0, 1000, { random: alwaysMax }),
+			).toBeLessThanOrEqual(1000);
+			expect(
+				computeRetryBackoffMs(1, 1000, { random: alwaysMax }),
+			).toBeLessThanOrEqual(2000);
+			expect(
+				computeRetryBackoffMs(2, 1000, { random: alwaysMax }),
+			).toBeLessThanOrEqual(4000);
+		});
+
+		it("caps the exponential growth at the configured maximum", () => {
+			const alwaysMax = () => 0.999999;
+			expect(
+				computeRetryBackoffMs(20, 1000, { random: alwaysMax }),
+			).toBeLessThanOrEqual(MAX_RETRY_BACKOFF_MS);
+			expect(computeRetryBackoffMs(20, 1000, { random: () => 1 })).toBe(
+				MAX_RETRY_BACKOFF_MS,
+			);
+			expect(
+				computeRetryBackoffMs(0, 1000, { capMs: 500, random: () => 1 }),
+			).toBe(500);
+		});
+
+		it("decorrelates concurrent retries via jitter", () => {
+			const samples = new Set(
+				Array.from({ length: 20 }, () => computeRetryBackoffMs(2, 1000)),
+			);
+			// 20 full-jitter draws colliding would be a ~0-probability event.
+			expect(samples.size).toBeGreaterThan(1);
+		});
+
+		it("treats non-positive inputs as no backoff", () => {
+			const alwaysMax = () => 0.999999;
+			expect(
+				computeRetryBackoffMs(-1, 1000, { random: alwaysMax }),
+			).toBeLessThanOrEqual(1000);
+			expect(computeRetryBackoffMs(0, 0, { random: alwaysMax })).toBe(0);
+			expect(computeRetryBackoffMs(0, -50, { random: alwaysMax })).toBe(0);
+		});
+	});
+
 	describe("withFetchDeadline", () => {
 		it("resolves with the wrapped value when it settles before the deadline", async () => {
 			await expect(
@@ -479,6 +527,22 @@ describe("Utility Functions", () => {
 			await expect(withFetchDeadline(p, -1, "test")).resolves.toBe(
 				"passthrough",
 			);
+		});
+	});
+
+	describe("withSignal", () => {
+		// Pins the exactOptional contract: RequestInit is lib.dom (no
+		// undefined members), so a missing signal is omitted, not assigned.
+		it("omits the signal key when undefined", () => {
+			const init = withSignal({ method: "GET" }, undefined);
+			expect("signal" in init).toBe(false);
+		});
+
+		it("attaches a defined signal and returns the same object", () => {
+			const controller = new AbortController();
+			const init: RequestInit = { method: "GET" };
+			expect(withSignal(init, controller.signal)).toBe(init);
+			expect(init.signal).toBe(controller.signal);
 		});
 	});
 });

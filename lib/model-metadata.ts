@@ -1,15 +1,17 @@
 import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
-import { getBuiltinModels } from "@earendil-works/pi-ai/providers/all";
 import { DEFAULT_FETCH_TIMEOUT_MS, URL_MODELS_DEV } from "../constants.ts";
 import { createLogger } from "./logger.ts";
+import { loadPiAiEntry } from "./pi-ai-loader.ts";
 import { getProxyModelCompat } from "./provider-compat.ts";
-import type {
-	CostConfig,
-	ModelIdentity,
-	ModelMatchHints,
-	ModelsDevEnrichedMetadata,
-	ModelsDevModel,
-	ModelsDevProvider,
+import {
+	isChatModelConfig,
+	type ChatModelConfig,
+	type CostConfig,
+	type ModelIdentity,
+	type ModelMatchHints,
+	type ModelsDevEnrichedMetadata,
+	type ModelsDevModel,
+	type ModelsDevProvider,
 } from "./types.ts";
 
 const DEFAULT_CONTEXT_WINDOW = 128_000;
@@ -24,8 +26,8 @@ const MODELS_DEV_PROVIDER_ALIASES: Record<string, string> = {
 
 const _logger = createLogger("model-metadata");
 
-type ThinkingLevelMap = NonNullable<ProviderModelConfig["thinkingLevelMap"]>;
-type ModelCompat = NonNullable<ProviderModelConfig["compat"]>;
+type ThinkingLevelMap = NonNullable<ChatModelConfig["thinkingLevelMap"]>;
+type ModelCompat = NonNullable<ChatModelConfig["compat"]>;
 type ModelsDevMeta = Record<string, ModelsDevModel>;
 type ModelsDevMetaIndex = Map<string, ModelsDevModel>;
 type CatalogCache = {
@@ -254,9 +256,9 @@ function identityFromMeta(
 }
 
 function mergeCompat(
-	existing: ProviderModelConfig["compat"],
-	derived: ProviderModelConfig["compat"],
-): ProviderModelConfig["compat"] | undefined {
+	existing: ChatModelConfig["compat"],
+	derived: ChatModelConfig["compat"],
+): ChatModelConfig["compat"] | undefined {
 	if (!existing) return derived;
 	if (!derived) return existing;
 	return { ...(derived as ModelCompat), ...(existing as ModelCompat) };
@@ -264,7 +266,7 @@ function mergeCompat(
 
 export interface ModelsDevEnrichmentOptions {
 	/** Provider id to scope models.dev lookup. Omit to search all providers. */
-	providerId?: string;
+	providerId?: string | undefined;
 	/** Values treated as provider defaults and safe to replace from models.dev. */
 	fallbackContextWindows?: number[];
 	fallbackMaxTokens?: number[];
@@ -288,7 +290,7 @@ interface EnrichmentContext {
 	enrichCompat: boolean;
 }
 
-function enrichModel<T extends ProviderModelConfig>(
+function enrichModel<T extends ChatModelConfig>(
 	model: T,
 	ctx: EnrichmentContext,
 ): T & ModelsDevEnrichedMetadata {
@@ -386,6 +388,12 @@ export async function enrichModelsWithModelsDev<T extends ProviderModelConfig>(
 
 	return models.map((model) => {
 		try {
+			// Chat-only enrichment: image/classifier entries pass through
+			// unchanged (pi 1.x union). The cast is safe: ModelsDevEnrichedMetadata
+			// only adds an optional field the entry already satisfies by absence.
+			if (!isChatModelConfig(model)) {
+				return model as T & ModelsDevEnrichedMetadata;
+			}
 			return enrichModel(model, ctx);
 		} catch (error) {
 			_logger.warn("Failed to enrich model from models.dev metadata", {
@@ -414,22 +422,44 @@ export async function safeEnrichModelsWithModelsDev<
 // Native catalog fallback (Pi's build-time models.dev snapshot)
 // =============================================================================
 
-const NATIVE_FALLBACK_CONTEXT_WINDOWS = new Set([DEFAULT_CONTEXT_WINDOW, 4096]);
-const NATIVE_FALLBACK_MAX_TOKENS = new Set([DEFAULT_MAX_TOKENS, 4096]);
-
 type NativeCatalogModel = Pick<
-	ProviderModelConfig,
+	ChatModelConfig,
 	"id" | "api" | "baseUrl" | "compat" | "contextWindow" | "maxTokens" | "cost"
 >;
 
-function getNativeCatalogModels(providerId: string): NativeCatalogModel[] {
-	try {
-		return getBuiltinModels(
-			providerId as Parameters<typeof getBuiltinModels>[0],
-		) as NativeCatalogModel[];
-	} catch {
-		return [];
+type PiAiProvidersAll = typeof import("@earendil-works/pi-ai/providers/all");
+
+let builtinModelsModulePromise: Promise<PiAiProvidersAll> | undefined;
+
+/**
+ * Single-flight cached dynamic import of Pi's build-time native catalog.
+ * The module is heavy and only needed on the models.dev enrichment fallback
+ * paths, so it must never be imported eagerly at startup.
+ */
+function loadBuiltinModelsModule(): Promise<PiAiProvidersAll> {
+	if (!builtinModelsModulePromise) {
+		builtinModelsModulePromise = loadPiAiEntry<PiAiProvidersAll>(
+			"providers/all",
+		).catch((error) => {
+			// Do not cache failures: a transient load error must not break
+			// every later fallback lookup.
+			builtinModelsModulePromise = undefined;
+			throw error;
+		});
 	}
+	return builtinModelsModulePromise;
+}
+
+function getNativeCatalogModels(
+	providerId: string,
+): Promise<NativeCatalogModel[]> {
+	return loadBuiltinModelsModule()
+		.then(({ getBuiltinModels }) => {
+			return getBuiltinModels(
+				providerId as Parameters<typeof getBuiltinModels>[0],
+			) as NativeCatalogModel[];
+		})
+		.catch(() => []);
 }
 
 function hasZeroTokenCost(cost: CostConfig): boolean {
@@ -447,12 +477,15 @@ function hasZeroTokenCost(cost: CostConfig): boolean {
  * `-free` suffix. Preserve that authoritative native signal for dynamic
  * discovery while leaving unknown models on the normal name-based path.
  */
-export function applyNativeFreeMetadata<T extends ProviderModelConfig>(
+export async function applyNativeFreeMetadata<T extends ProviderModelConfig>(
 	models: T[],
 	providerId: string,
-): Array<T & { _freeKnown?: boolean; _isFree?: boolean }> {
+): Promise<Array<T & { _freeKnown?: boolean; _isFree?: boolean }>> {
 	const nativeById = new Map(
-		getNativeCatalogModels(providerId).map((model) => [model.id, model]),
+		(await getNativeCatalogModels(providerId)).map((model) => [
+			model.id,
+			model,
+		]),
 	);
 
 	return models.map((model) => {
@@ -467,17 +500,19 @@ export function applyNativeFreeMetadata<T extends ProviderModelConfig>(
  * returns model IDs. This prevents a live catalog refresh from flattening
  * Anthropic, Responses, and Google models into one OpenAI-compatible route.
  */
-export function applyNativeProtocolMetadata<T extends ProviderModelConfig>(
-	models: T[],
-	providerId: string,
-): T[] {
+export async function applyNativeProtocolMetadata<
+	T extends ProviderModelConfig,
+>(models: T[], providerId: string): Promise<T[]> {
 	const nativeById = new Map(
-		getNativeCatalogModels(providerId).map((model) => [model.id, model]),
+		(await getNativeCatalogModels(providerId)).map((model) => [
+			model.id,
+			model,
+		]),
 	);
 
 	return models.map((model) => {
 		const native = nativeById.get(model.id);
-		if (!native) return model;
+		if (!native || !isChatModelConfig(model)) return model;
 
 		const compat =
 			native.compat || model.compat
@@ -490,46 +525,4 @@ export function applyNativeProtocolMetadata<T extends ProviderModelConfig>(
 			...(compat ? { compat } : {}),
 		};
 	});
-}
-
-/**
- * Fill context windows / max tokens from Pi's built-time native catalog
- * (shipped in `@earendil-works/pi-ai`) for models still carrying a generic
- * fallback value after the models.dev enrichment pass. Synchronous, local,
- * always available — no network required.
- */
-export function enrichFromNativeCatalog<T extends ProviderModelConfig>(
-	models: T[],
-	providerId: string,
-): T[] {
-	if (models.length === 0) return models;
-
-	const nativeModels = getNativeCatalogModels(providerId);
-	if (nativeModels.length === 0) return models;
-
-	const nativeById = new Map(nativeModels.map((m) => [m.id, m]));
-
-	let patched = 0;
-	const result = models.map((model) => {
-		if (!NATIVE_FALLBACK_CONTEXT_WINDOWS.has(model.contextWindow)) return model;
-		const native = nativeById.get(model.id);
-		if (!native) return model;
-
-		patched++;
-		return {
-			...model,
-			contextWindow: native.contextWindow,
-			maxTokens: NATIVE_FALLBACK_MAX_TOKENS.has(model.maxTokens)
-				? native.maxTokens
-				: model.maxTokens,
-		};
-	});
-
-	if (patched > 0) {
-		_logger.info(
-			`[native-catalog] ${providerId}: patched ${patched}/${models.length} models from Pi's native catalog`,
-		);
-	}
-
-	return result;
 }

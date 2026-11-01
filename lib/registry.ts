@@ -6,7 +6,7 @@
  */
 
 import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
-import { getFreeOnly, getProviderShowPaid, saveConfig } from "../config.ts";
+import { getFreeOnly, getModelViewOverride, saveConfig } from "../config.ts";
 import { createLogger } from "./logger.ts";
 
 const _logger = createLogger("pi-free");
@@ -21,9 +21,9 @@ interface ProviderEntry {
 	reRegister: (models: ProviderModelConfig[]) => void;
 	hasKey: boolean;
 	/** Native providers keep the complete catalog and filter it in Pi. */
-	native?: boolean;
+	native?: boolean | undefined;
 	/** Re-register the native provider without rebuilding a model array. */
-	invalidate?: () => void;
+	invalidate?: (() => void) | undefined;
 }
 
 // =============================================================================
@@ -32,7 +32,6 @@ interface ProviderEntry {
 
 const providerRegistry = new Map<string, ProviderEntry>();
 let globalFreeOnly = getFreeOnly();
-let globalFreeOnlyForced = false;
 
 // =============================================================================
 // Free-model detection
@@ -55,6 +54,22 @@ function detectPricingExposed(allModels: ProviderModelConfig[]): boolean {
 	return allModels.some(
 		(m) => (m.cost?.input ?? 0) > 0 || (m.cost?.output ?? 0) > 0,
 	);
+}
+
+/**
+ * Memoized pricing-exposure verdicts keyed by catalog array identity.
+ * WeakMap so replaced catalogs are collectable; safe because the verdict
+ * is a pure function of the array contents and update paths replace the
+ * catalog reference instead of mutating it in place.
+ */
+const pricingExposedCache = new WeakMap<ProviderModelConfig[], boolean>();
+
+function isPricingExposedCached(allModels: ProviderModelConfig[]): boolean {
+	const cached = pricingExposedCache.get(allModels);
+	if (cached !== undefined) return cached;
+	const verdict = detectPricingExposed(allModels);
+	pricingExposedCache.set(allModels, verdict);
+	return verdict;
 }
 
 /**
@@ -85,10 +100,12 @@ function detectPricingExposed(allModels: ProviderModelConfig[]): boolean {
  */
 export function isFreeModel(
 	model: ProviderModelConfig & {
-		provider?: string;
-		_pricingKnown?: boolean;
-		_freeKnown?: boolean;
-		_isFree?: boolean;
+		// Explicit undefined is tolerated (and pinned by tests): absent
+		// and undefined behave identically in the Route A/B checks below.
+		provider?: string | undefined;
+		_pricingKnown?: boolean | undefined;
+		_freeKnown?: boolean | undefined;
+		_isFree?: boolean | undefined;
 	},
 	allModels?: ProviderModelConfig[],
 ): boolean {
@@ -98,10 +115,10 @@ export function isFreeModel(
 // Internal implementation to work around TypeScript filter callback issues
 function isFreeModelInternal(
 	model: ProviderModelConfig & {
-		provider?: string;
-		_pricingKnown?: boolean;
-		_freeKnown?: boolean;
-		_isFree?: boolean;
+		provider?: string | undefined;
+		_pricingKnown?: boolean | undefined;
+		_freeKnown?: boolean | undefined;
+		_isFree?: boolean | undefined;
 	},
 	allModels: ProviderModelConfig[] | undefined,
 ): boolean {
@@ -112,13 +129,18 @@ function isFreeModelInternal(
 		return model._isFree === true;
 	}
 
-	// Determine if pricing is exposed
+	// Determine if pricing is exposed. Every model in a catalog-filter pass
+	// shares the same `allModels` array reference, and the scan below is
+	// O(n) per call — so memoize the verdict per array identity (WeakMap:
+	// no retention after the catalog is replaced). Repeated calls with the
+	// same array (the common filter path) skip the rescan; behavior is
+	// identical, only the redundant O(n) scans disappear.
 	let pricingExposed: boolean;
 
 	if (allModels && allModels.length > 0) {
 		// Dynamic detection: check if ALL models have cost === 0
 		// If all costs are 0, assume pricing is NOT actually exposed
-		pricingExposed = detectPricingExposed(allModels);
+		pricingExposed = isPricingExposedCached(allModels);
 	} else {
 		// No allModels provided - default to cost-based detection
 		// This maintains backward compatibility
@@ -177,9 +199,18 @@ export function getGlobalFreeOnly(): boolean {
 	return globalFreeOnly;
 }
 
-/** Whether the current global toggle explicitly overrides provider paid views. */
-export function getGlobalFreeOnlyForced(): boolean {
-	return globalFreeOnlyForced;
+/**
+ * Effective catalog view for a provider — the single rule behind every
+ * filter decision (global filter, native filtering, built-in capture):
+ * an explicit per-provider choice wins, otherwise the global default
+ * applies. No force flags, no preservation branches.
+ */
+export type ModelView = "free" | "all";
+
+export function resolveModelView(providerId: string): ModelView {
+	return (
+		getModelViewOverride(providerId) ?? (getGlobalFreeOnly() ? "free" : "all")
+	);
 }
 
 /** Access the raw registry (used by /free-providers command) */
@@ -202,12 +233,8 @@ function showAllForProvider(providerId: string, entry: ProviderEntry): void {
 	}
 }
 
-function applyFilterToProvider(
-	providerId: string,
-	entry: ProviderEntry,
-	freeOnly: boolean,
-	force: boolean,
-): void {
+function applyFilterToProvider(providerId: string, entry: ProviderEntry): void {
+	const view = resolveModelView(providerId);
 	if (entry.native) {
 		// Native providers expose their complete catalog through getModels().
 		// Re-register the same object only to invalidate Pi's availability
@@ -216,7 +243,7 @@ function applyFilterToProvider(
 			entry.invalidate();
 		} else {
 			entry.reRegister(
-				freeOnly
+				view === "free"
 					? entry.stored.free
 					: entry.stored.all.length > 0
 						? entry.stored.all
@@ -224,49 +251,33 @@ function applyFilterToProvider(
 			);
 		}
 		_logger.info(
-			`[pi-free] ${providerId}: invalidated native model filter (${freeOnly ? "free" : "all"}${force ? ", forced" : ""})`,
+			`[pi-free] ${providerId}: invalidated native model filter (${view})`,
 		);
 		return;
 	}
 
-	if (freeOnly) {
-		if (!force && getProviderShowPaid(providerId)) {
-			showAllForProvider(providerId, entry);
-			_logger.info(
-				`[pi-free] ${providerId}: preserved persisted all-models toggle`,
-			);
-			return;
-		}
-
-		if (entry.stored.free.length > 0) {
-			entry.reRegister(entry.stored.free);
-			_logger.info(
-				`[pi-free] ${providerId}: filtered to ${entry.stored.free.length} free models`,
-			);
-		} else {
-			_logger.warn(`[pi-free] ${providerId}: no free models available`);
-		}
+	if (view === "free") {
+		// Strict: register the free list even when it is empty (the provider
+		// then hides from the picker) — retaining the previous registration
+		// would leak the paid catalog it was meant to hide. An empty free
+		// list under free-only is routine for paid-only catalogs, not a
+		// warning.
+		entry.reRegister(entry.stored.free);
+		_logger.info(
+			`[pi-free] ${providerId}: filtered to ${entry.stored.free.length} free models`,
+		);
 	} else {
 		showAllForProvider(providerId, entry);
 	}
 }
 
-export function applyGlobalFilter(
-	freeOnly: boolean,
-	options: { force?: boolean } = {},
-): void {
+export function applyGlobalFilter(freeOnly: boolean): void {
 	globalFreeOnly = freeOnly;
-	globalFreeOnlyForced = freeOnly && options.force === true;
 	void saveConfig({ free_only: freeOnly });
 
 	for (const [providerId, entry] of providerRegistry) {
 		try {
-			applyFilterToProvider(
-				providerId,
-				entry,
-				freeOnly,
-				options.force === true,
-			);
+			applyFilterToProvider(providerId, entry);
 		} catch (err) {
 			_logger.error(
 				`[pi-free] Failed to apply filter to ${providerId}`,

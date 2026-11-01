@@ -10,14 +10,32 @@ All slash commands provided by pi-free.
 | --- | --- |
 | `/toggle-free` | Toggle global free-only mode for all providers. |
 | `/free-providers` | Show the current free/paid model view for registered providers. |
-| `/pi-free-health` | Show a credential-free health report, startup/session issues, registered-provider count, and the diagnostic log path. |
+| `/pi-free-health` | Show a credential-free health report, startup/session issues, registered-provider count, the diagnostic log path, and pi-ai resolution (which copy the bare specifier resolves vs. which one serves the entries). |
 | `/free-startup` | Show the latest startup timing summary, including provider timings, cache/network activity, session-start handlers, and detached work. |
-| `/free-telemetry` | Show optional real-world performance data for free models. |
+| `/free-telemetry` | Show optional real-world performance data for free models, plus the pi-ai resolution block (same formatter as `/pi-free-health`). |
 | `/clear-free-telemetry` | Clear stored telemetry data. |
+
+## Auto-Fallback
+
+| Command | Description |
+| --- | --- |
+| `/toggle-auto-fallback` | Toggle automatic fallback to another free model when the current one errors. |
+| `/free-fallback-history` | Show auto-fallback switch history for the current session. |
+| `/reset-fallback-blacklist` | Clear the auto-fallback in-memory blacklist (unban every model). |
+
+## Infron Rate-Limit Continuation
+
+| Command | Description |
+| --- | --- |
+| `/free-infron-retry` | Show credential-free Infron cooldown lifecycle diagnostics: current phase and bounded per-reason counters. |
+
+The command never prints error text, payloads, headers or credentials. See [the rate-limit continuation section](../README.md#infron-rate-limit-continuation).
 
 ## Per-Provider Toggles
 
 Run `/toggle-{provider}` to switch between a provider's free/basic view and its full catalog. The preference is saved in `~/.pi/free.json`.
+
+To remove a provider from the model picker entirely, run `/hide-provider <provider-id>`; `/show-provider <provider-id>` restores it. Hiding writes a `provider-id/*` wildcard into `hidden_models`, so it composes with per-model hiding and takes effect immediately (the current free/all view is re-applied).
 
 | Command | Provider | Surface |
 | --- | --- | --- |
@@ -26,7 +44,6 @@ Run `/toggle-{provider}` to switch between a provider's free/basic view and its 
 | `/toggle-ollama-cloud` | Ollama Cloud | Native |
 | `/toggle-llm7` | LLM7 | Native |
 | `/toggle-zenmux` | ZenMux | Native |
-| `/toggle-crofai` | CrofAI | Native |
 | `/toggle-deepinfra` | DeepInfra | Native |
 | `/toggle-sambanova` | SambaNova | Native |
 | `/toggle-novita` | Novita AI | Native |
@@ -35,13 +52,21 @@ Run `/toggle-{provider}` to switch between a provider's free/basic view and its 
 | `/toggle-tokenrouter` | TokenRouter | Native |
 | `/toggle-anyapi` | AnyAPI | Native |
 | `/toggle-bai` | B.AI | Native |
+| `/toggle-orcarouter` | OrcaRouter | Native |
+| `/toggle-xkiro` | Xkiro | Native |
 | `/toggle-stepfun` | StepFun | Native |
-| `/toggle-openmodel` | OpenModel | Native |
 | `/toggle-qoder` | Qoder | Legacy |
 | `/toggle-openrouter` | OpenRouter | Pi built-in |
-| `/toggle-opencode` | OpenCode | Pi built-in |
-| `/toggle-opencode-go` | OpenCode Go | Pi built-in |
+| `/toggle-opencode-free` | OpenCode Zen free wrapper | Pi built-in catalog + detached Zen refresh |
+| `/toggle-opencode-go` | OpenCode Go | Pi built-in catalog + detached Go refresh |
 | `/toggle-fastrouter` | FastRouter | Native |
+| `/toggle-gmi` | GMI Cloud | Native |
+| `/toggle-agnes` | Agnes AI | Native |
+| `/toggle-requesty` | Requesty | Native |
+| `/toggle-venice` | Venice AI | Native |
+| `/toggle-infron` | Infron AI | Native |
+| `/toggle-merge` | Merge Gateway | Native |
+| `/toggle-commandcode` | CommandCode | Native |
 
 Native providers retain their complete catalog and let Pi apply the current filter. All pi-free providers now use the native provider lifecycle; Pi built-in providers retain Pi-owned catalogs.
 
@@ -60,8 +85,9 @@ Qoder PAT authentication can also use `QODER_PERSONAL_ACCESS_TOKEN` or its `QODE
 ## Ollama Cloud Refresh
 
 | Command | Description |
-|---|---|
+| --- | --- |
 | `/ollama-cloud-refresh` | Re-fetch Ollama Cloud's catalog and update the provider live. Requires `OLLAMA_API_KEY`. |
+| `/ollama-cloud-usage` | Show Ollama Cloud session and weekly usage limits. |
 
 Ollama Cloud is a native provider, but this compatibility command and `/api/show` capability reuse continue to use `~/.pi/provider-cache.json`.
 

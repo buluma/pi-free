@@ -24,33 +24,28 @@
  * module performs no freshness gating of its own so the two never double-throttle.
  */
 
-import {
-	openAICompletionsApi,
-	type Api,
-	type Credential,
-	type Model,
-	type Provider,
-	type RefreshModelsContext,
+import type {
+	Credential,
+	Model,
+	Provider,
+	RefreshModelsContext,
 } from "@earendil-works/pi-ai/compat";
 import type { ProviderModelConfig } from "@earendil-works/pi-coding-agent";
-import {
-	getKiloApiKey,
-	getKiloFreeOnly,
-	getKiloShowPaid,
-} from "../../config.ts";
+import { getKiloApiKey, getKiloFreeOnly } from "../../config.ts";
 import { PROVIDER_KILO } from "../../constants.ts";
 import { isFreeModel } from "../../lib/registry.ts";
 import {
 	filterNativeModels,
-	persistNativeProviderModels,
-	restoreNativeProviderModels,
+	refreshNativeProviderModels,
 } from "../../lib/native-provider.ts";
+import { lazyOpenAICompletionsApi } from "../../lib/lazy-compat.ts";
 import { enhanceWithCI, type StoredModels } from "../../provider-helper.ts";
 import { kiloAuth } from "./kilo-auth.ts";
 import {
 	applyKiloCompat,
 	fetchKiloCatalog,
 	KILO_GATEWAY_BASE,
+	normalizeStoredKiloModels,
 	toKiloModels,
 } from "./kilo-models.ts";
 
@@ -80,7 +75,7 @@ function credentialToken(credential?: Credential): string | undefined {
  * truth.
  */
 export function createKiloProvider(): KiloNativeProvider {
-	const streams = openAICompletionsApi();
+	const streams = lazyOpenAICompletionsApi();
 
 	// Display-ready catalogs (CI-enhanced + compat-shaped + converted to Model).
 	// Typed as StoredModels (ProviderModelConfig[]) for registerWithGlobalToggle;
@@ -107,41 +102,40 @@ export function createKiloProvider(): KiloNativeProvider {
 	}
 
 	async function refreshModels(context: RefreshModelsContext): Promise<void> {
-		await restoreNativeProviderModels(
+		// Free split of the most recent fetch, kept beside the flat list the
+		// shared helper passes through (see the fetch callback below).
+		let fetchedFree: KiloModel[] = [];
+		// Shared skeleton: restore → allowNetwork gate → abort checks → fetch →
+		// empty-retain → persist, with the M1 counters recorded centrally.
+		await refreshNativeProviderModels(
 			PROVIDER_KILO,
 			context,
 			(storedModels: KiloModel[]) => {
-				stored.all = storedModels;
-				stored.free = storedModels.filter((model) =>
+				// Re-stamp identity headers — a store snapshot written before the
+				// headers existed would otherwise reach the wire headerless.
+				const normalized = normalizeStoredKiloModels(storedModels);
+				stored.all = normalized;
+				stored.free = normalized.filter((model) =>
 					isFreeModel({ ...model, provider: PROVIDER_KILO }, storedModels),
 				);
 			},
-		);
-
-		// Offline init stops here: serve the store only.
-		if (!context.allowNetwork || context.signal?.aborted) return;
-
-		// Online: fetch a fresh catalog with the resolved+refreshed credential.
-		const { all, free } = await fetchKiloCatalog({
-			token: credentialToken(context.credential),
-			signal: context.signal,
-		});
-		if (context.signal?.aborted) return;
-
-		// Retain the previous list on a degenerate/failed fetch (poisoning guard).
-		if (all.length === 0) return;
-
-		const next = prepare(all, free);
-		await persistNativeProviderModels(
-			PROVIDER_KILO,
-			context,
-			// next.all holds full Model objects at runtime (toKiloModels output);
-			// the StoredModels type widens them to ProviderModelConfig for the toggle.
-			next.all as unknown as readonly Model<Api>[],
-			() => {
-				stored.all = next.all;
-				stored.free = next.free;
+			async () => {
+				// Online: fetch a fresh catalog with the resolved+refreshed credential.
+				const { all, free } = await fetchKiloCatalog({
+					token: credentialToken(context.credential),
+					signal: context.signal,
+				});
+				const next = prepare(all, free);
+				// The shared helper's fetch callback returns one flat list; keep the
+				// catalog's own free split alongside it for onFetched below.
+				fetchedFree = next.free;
+				return next.all;
 			},
+			(next) => {
+				stored.all = next;
+				stored.free = fetchedFree;
+			},
+			stored,
 		);
 	}
 
@@ -149,16 +143,14 @@ export function createKiloProvider(): KiloNativeProvider {
 		id: PROVIDER_KILO,
 		name: "Kilo",
 		baseUrl: KILO_GATEWAY_BASE,
-		headers: {
-			"X-KILOCODE-EDITORNAME": "Pi",
-			"User-Agent": "pi-free-providers",
-		},
+		// Identity headers are stamped per-model (KILO_IDENTITY_HEADERS in
+		// kilo-models.ts) — pi-ai merges only model.headers into requests, so
+		// a provider-level block here would be silently inert.
 		auth: kiloAuth,
 		getModels: () =>
 			(stored.all.length > 0 ? stored.all : stored.free) as KiloModel[],
 		filterModels: (models) =>
 			filterNativeModels(PROVIDER_KILO, models, {
-				showPaid: getKiloShowPaid(),
 				freeModels: stored.free,
 				forceFree: getKiloFreeOnly(),
 			}),

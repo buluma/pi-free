@@ -1,16 +1,15 @@
-import {
-	openAICompletionsApi,
-	type Credential,
-	type Model,
-	type Provider,
-	type RefreshModelsContext,
+import type {
+	Credential,
+	Model,
+	Provider,
+	RefreshModelsContext,
 } from "@earendil-works/pi-ai/compat";
 import type {
 	ExtensionAPI,
 	ExtensionCommandContext,
 	ProviderModelConfig,
 } from "@earendil-works/pi-coding-agent";
-import { getOllamaApiKey, getOllamaShowPaid } from "../../config.ts";
+import { getOllamaApiKey } from "../../config.ts";
 import { BASE_URL_OLLAMA, PROVIDER_OLLAMA } from "../../constants.ts";
 import {
 	filterNativeModels,
@@ -18,18 +17,26 @@ import {
 	registerNativeProvider,
 	registerNativeProviderRefresh,
 	registerNativeProviderToggle,
+	withGatewayCompat,
 } from "../../lib/native-provider.ts";
 import { areAllModelsFresh } from "../../lib/probe-cache.ts";
 import {
 	loadProviderCache,
-	saveProviderCache,
+	saveProviderCacheGuarded,
 } from "../../lib/provider-cache.ts";
 import {
 	trackDetachedSessionStart,
 	wrapSessionStartHandler,
 } from "../../lib/session-start-metrics.ts";
-import { registerWithGlobalToggle } from "../../lib/registry.ts";
+import { registerWithGlobalToggle, isFreeModel } from "../../lib/registry.ts";
+import { lazyOpenAICompletionsApi } from "../../lib/lazy-compat.ts";
+import {
+	fetchUsage,
+	formatUsage,
+	formatUsageStatusColored,
+} from "./ollama-usage.ts";
 import { enhanceWithCI, type StoredModels } from "../../provider-helper.ts";
+import { isChatModelConfig } from "../../lib/types.ts";
 import { ollamaAuth } from "./ollama-auth.ts";
 
 export interface OllamaProviderDeps {
@@ -65,23 +72,25 @@ function credentialToken(credential?: Credential): string | undefined {
 }
 
 function toOllamaModel(model: ProviderModelConfig): OllamaModel {
-	return {
+	return withGatewayCompat({
 		...model,
 		api: "openai-completions",
 		provider: PROVIDER_OLLAMA,
 		baseUrl: BASE_URL_OLLAMA,
-	} as OllamaModel;
+	} as OllamaModel);
 }
 
 function toOllamaModels(models: ProviderModelConfig[]): OllamaModel[] {
-	return models.map(toOllamaModel);
+	// Chat-only catalog: image/classifier entries cannot be served as chat
+	// models (pi 1.x union).
+	return models.filter(isChatModelConfig).map(toOllamaModel);
 }
 
 export function createOllamaProvider(
 	deps: OllamaProviderDeps,
 	initialModels: ProviderModelConfig[] = deps.fallbackModels,
 ): OllamaNativeProvider {
-	const streams = openAICompletionsApi();
+	const streams = lazyOpenAICompletionsApi();
 	const stored: StoredModels = { free: [], all: [] };
 
 	function ingest(
@@ -96,7 +105,12 @@ export function createOllamaProvider(
 
 	function restoreStoredModels(storedModels: OllamaModel[]): void {
 		stored.all = storedModels;
-		stored.free = storedModels;
+		// Reclassify free/paid like every other custom native provider — a blind
+		// `stored.free = storedModels` made the free-only view show paid models
+		// after a store restore.
+		stored.free = storedModels.filter((model) =>
+			isFreeModel({ ...model, provider: PROVIDER_OLLAMA }, storedModels),
+		);
 	}
 
 	async function refreshOllamaModels(
@@ -114,13 +128,20 @@ export function createOllamaProvider(
 					loadProviderCache(PROVIDER_OLLAMA),
 					context.signal,
 				);
-				await saveProviderCache(PROVIDER_OLLAMA, fresh);
+				// A degenerate/empty fetch must not overwrite the capability cache —
+				// return before saving so refreshNativeProviderModels' empty-retain
+				// path keeps both the previous catalog AND the previous cache.
+				if (fresh.length === 0) return [];
+				await saveProviderCacheGuarded(PROVIDER_OLLAMA, fresh);
 				return toOllamaModels(enhanceWithCI(fresh, PROVIDER_OLLAMA));
 			},
 			(models) => {
 				stored.all = models;
-				stored.free = models;
+				stored.free = models.filter((model) =>
+					isFreeModel({ ...model, provider: PROVIDER_OLLAMA }, models),
+				);
 			},
+			stored,
 		);
 	}
 
@@ -134,7 +155,6 @@ export function createOllamaProvider(
 			(stored.all.length > 0 ? stored.all : stored.free) as OllamaModel[],
 		filterModels: (models) =>
 			filterNativeModels(PROVIDER_OLLAMA, models, {
-				showPaid: getOllamaShowPaid(),
 				freeModels: stored.free,
 			}),
 		refreshModels: refreshOllamaModels,
@@ -181,8 +201,66 @@ export function registerOllamaProvider(
 	registerNativeProviderToggle(pi, {
 		providerId: PROVIDER_OLLAMA,
 		stored,
-		getShowPaid: getOllamaShowPaid,
 		reRegister,
+	});
+
+	// =========================================================================
+	// Usage integration (undocumented /api/usage endpoint)
+	// =========================================================================
+
+	const USAGE_STATUS_KEY = "ollama-usage";
+	const USAGE_REFRESH_MS = 5 * 60_000;
+	let usageTimer: ReturnType<typeof setInterval> | null = null;
+	let lastUsageRefreshAt = 0;
+
+	async function refreshUsageStatus(ctx: {
+		ui: ExtensionCommandContext["ui"];
+	}): Promise<void> {
+		const apiKey = getOllamaApiKey();
+		if (!apiKey) return;
+		try {
+			const data = await fetchUsage(apiKey);
+			lastUsageRefreshAt = Date.now();
+			const formatted = formatUsageStatusColored(ctx.ui.theme, data);
+			ctx.ui.setStatus(USAGE_STATUS_KEY, formatted);
+		} catch {
+			// Silent: the endpoint is undocumented and may change; failed fetches
+			// must not degrade the user experience.
+		}
+	}
+
+	pi.registerCommand("ollama-cloud-usage", {
+		description: "Show Ollama Cloud session and weekly usage limits",
+		handler: async (_args: string, ctx: ExtensionCommandContext) => {
+			const apiKey = getOllamaApiKey();
+			if (!apiKey) {
+				ctx.ui.notify("OLLAMA_API_KEY not set", "error");
+				return;
+			}
+			try {
+				const data = await fetchUsage(apiKey);
+				ctx.ui.notify(formatUsage(data), "info");
+			} catch (error) {
+				ctx.ui.notify(
+					`Usage fetch failed: ${error instanceof Error ? error.message : String(error)}`,
+					"error",
+				);
+			}
+		},
+	});
+
+	pi.on("agent_end", async (_event, ctx) => {
+		if (ctx.model?.provider !== PROVIDER_OLLAMA) return;
+		if (Date.now() - lastUsageRefreshAt < USAGE_REFRESH_MS) return;
+		await refreshUsageStatus(ctx);
+	});
+
+	pi.on("session_shutdown", async (_event, ctx) => {
+		if (usageTimer) {
+			clearInterval(usageTimer);
+			usageTimer = null;
+		}
+		ctx.ui.setStatus(USAGE_STATUS_KEY, "");
 	});
 
 	pi.registerCommand("ollama-cloud-refresh", {
@@ -200,7 +278,16 @@ export function registerOllamaProvider(
 					apiKey,
 					loadProviderCache(PROVIDER_OLLAMA),
 				);
-				await saveProviderCache(PROVIDER_OLLAMA, fresh);
+				// Never persist (or apply) a degenerate fetch: a transient
+				// shrink or empty response keeps the previous cache AND the
+				// live list (#607).
+				if (!(await saveProviderCacheGuarded(PROVIDER_OLLAMA, fresh))) {
+					ctx.ui.notify(
+						`Ollama Cloud refresh returned ${fresh.length} models; keeping the cached list.`,
+						"warning",
+					);
+					return;
+				}
 				applyModelList(fresh);
 				ctx.ui.notify(
 					`Registered ${fresh.length} Ollama Cloud models (refresh complete)`,

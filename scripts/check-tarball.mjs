@@ -89,6 +89,7 @@ const required = [
 	"package/scripts/check-extensions.mjs",
 	"package/scripts/pi-install-smoke.mjs",
 	"package/scripts/rpc-load-check.mjs",
+	"package/scripts/lib/rpc-driver.mjs",
 ];
 
 for (const file of required) {
@@ -103,7 +104,7 @@ const forbiddenPatterns = [
 	/^package\/.+\.tgz$/,
 	/^package\/.+\.env(?:\..*)?$/,
 	/^package\/(?:\.env(?:\..*)?|npm-debug\.log|yarn-error\.log)$/,
-	/^package\/scripts\/(?!check-extensions\.mjs$|pi-install-smoke\.mjs$|rpc-load-check\.mjs$).+/,
+	/^package\/scripts\/(?!check-extensions\.mjs$|pi-install-smoke\.mjs$|rpc-load-check\.mjs$|lib\/rpc-driver\.mjs$).+/,
 ];
 
 const forbidden = entries.filter((entry) =>
@@ -133,7 +134,8 @@ try {
 			fail(`pi.extensions entry missing from tarball: ${extension}`);
 		}
 		console.log(`OK: pi.extensions -> ${extension}`);
-		if (normalized === "dist/index.js") compiledEntry = join(packageDir, normalized);
+		if (normalized === "dist/index.js")
+			compiledEntry = join(packageDir, normalized);
 	}
 	if (pkg.main) {
 		const normalized = String(pkg.main).replace(/^\.\//, "");
@@ -142,7 +144,8 @@ try {
 		}
 		console.log(`OK: main -> ${pkg.main}`);
 	}
-	if (!compiledEntry) fail("compiled dist/index.js is not the Pi extension entry");
+	if (!compiledEntry)
+		fail("compiled dist/index.js is not the Pi extension entry");
 
 	// Always validate JavaScript syntax. When run from a checkout after npm ci,
 	// temporarily link its peer dependencies so Node can import the extracted
